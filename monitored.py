@@ -29,7 +29,7 @@ NEVER = re.compile(r"/(WindowServer|kernel_task|launchd|loginwindow|Finder|Dock|
 SYSTEM_PATH = re.compile(r"^(/System/|/usr/|/sbin/|/bin/|/Library/Apple/)")
 BG_OK = {"photoanalysisd", "mediaanalysisd", "mdworker_shared", "mds_stores", "backupd", "suggestd", "parsecd", "siriknowledged", "cloudd"}
 # Work that matters: never demoted, and so is everything under it. Extend as needed (the AI can add names for the session).
-PRIORITY = re.compile(r"xcodebuild|swift-frontend|clang|ffmpeg|HandBrake|Final Cut|Premiere|DaVinci|Blender|Compressor|Docker|Parallels|VMware|UTM|qemu|postgres|mysqld|mongod|redis-server|nginx|gradle|\bcmake\b|\bninja\b|\bmake\b|ollama|llama-server|Spotify|zoom\.us|FaceTime|Discord|OBS|Logic Pro|GarageBand|Ableton|/Music\.app/|Microsoft Teams|/Claude\.app/|\.local/share/claude/versions|/claude( |$)|pytest|cargo|rustc|\bnpm run\b|vite|webpack|esbuild|\btsc\b")
+PRIORITY = re.compile(r"rsync|xcodebuild|swift-frontend|clang|ffmpeg|HandBrake|Final Cut|Premiere|DaVinci|Blender|Compressor|Docker|Parallels|VMware|UTM|qemu|postgres|mysqld|mongod|redis-server|nginx|gradle|\bcmake\b|\bninja\b|\bmake\b|ollama|llama-server|Spotify|zoom\.us|FaceTime|Discord|OBS|Logic Pro|GarageBand|Ableton|/Music\.app/|Microsoft Teams|/Claude\.app/|\.local/share/claude/versions|/claude( |$)|pytest|cargo|rustc|\bnpm run\b|vite|webpack|esbuild|\btsc\b")
 
 def _user_protect():
     """Programs the user asked Activity Monitored never to touch: one name per line in protect.txt (a command containing the name is protected)."""
@@ -70,7 +70,8 @@ def sample():
     return procs
 
 def pname(cmd):
-    return os.path.basename(re.split(r" --?\w", cmd)[0]).strip()[:40]
+    head = re.split(r" --?\w", cmd)[0].split(" /")[0]  # drop trailing path arguments: a scanner pointed at ~/x/edge is not called edge
+    return os.path.basename(head).strip()[:40]
 
 _last_po = [None, None]
 def memory_slow():

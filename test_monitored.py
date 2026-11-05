@@ -106,4 +106,11 @@ st = sh("python3", d13 + "/monitored.py", "status", env=e13).stdout
 sh("python3", d13 + "/monitored.py", "uninstall", env=e13)
 gone = sh("launchctl", "list", "com.monitored.test").returncode != 0 and not os.path.exists(os.path.expanduser("~/Library/LaunchAgents/com.monitored.test.plist"))
 check("installer starts it, status reads it, uninstall removes everything", "watching only" in r.stdout and up and "Running." in st and gone, "up %s gone %s" % (up, gone))
+# 14 program names ignore path arguments, and a copy job (rsync) is protected by default
+os.environ["MONITORED_DIR"] = tempfile.mkdtemp(); sys.path.insert(0, HERE); import monitored as _m
+names_ok = (_m.pname("gitleaks dir /Users/x/mirrors/edge --no-banner") == "gitleaks dir"
+            and _m.pname("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome Helper (Renderer) --type=renderer") == "Google Chrome Helper (Renderer)"
+            and _m.pname("/usr/bin/python3 /tmp/a/b.py -x") == "python3")
+check("program names ignore path arguments", names_ok)
+check("rsync is protected by default", bool(_m.PRIORITY.search("rsync -a /src /dst")))
 print("\n%d of %d passed" % (sum(results), len(results)))
