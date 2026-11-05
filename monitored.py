@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""Steady: keeps a Mac responsive when it is overloaded. macOS only, Python 3.8+, no packages to install.
-While the CPU is oversubscribed, Steady lowers the priority of busy background programs (taskpolicy -b), then restores them. Every action is undone by a timer.
-  steady install           install and start (one command; see README)
-  steady status            what Steady is doing right now and in the last 24 hours
-  steady on | watch | off  on: act. watch: log what it would do, change nothing. off: stop and undo everything
-  steady ai on|off         let a Claude model judge unfamiliar situations (default off; uses your own claude login)
-  steady battery on|off    battery saver: checks less often and makes no model calls while on battery
-  steady protect NAME      never touch programs whose command contains NAME
-  steady gate [--max-wait S] -- CMD   start CMD once memory is not thrashing (waits at most S seconds)
-  steady report | privacy | uninstall [--purge] | version
+"""Activity Monitored: keeps a Mac responsive when it is overloaded. macOS only, Python 3.8+, no packages to install.
+While the CPU is oversubscribed, Activity Monitored lowers the priority of busy background programs (taskpolicy -b), then restores them. Every action is undone by a timer.
+  monitored install           install and start (one command; see README)
+  monitored status            what Activity Monitored is doing right now and in the last 24 hours
+  monitored on | watch | off  on: act. watch: log what it would do, change nothing. off: stop and undo everything
+  monitored ai on|off         let a Claude model judge unfamiliar situations (default off; uses your own claude login)
+  monitored battery on|off    battery saver: checks less often and makes no model calls while on battery
+  monitored protect NAME      never touch programs whose command contains NAME
+  monitored gate [--max-wait S] -- CMD   start CMD once memory is not thrashing (waits at most S seconds)
+  monitored report | privacy | uninstall [--purge] | version
 """
 import ctypes, json, os, re, shutil, signal, subprocess, sys, threading, time
 from collections import defaultdict
 
 HOME = os.path.expanduser("~")
-DIR = os.environ.get("STEADY_DIR", os.path.join(HOME, ".steady"))
+DIR = os.environ.get("MONITORED_DIR", os.path.join(HOME, ".monitored"))
 os.makedirs(DIR, exist_ok=True)
 try: os.chmod(DIR, 0o700)
 except OSError: pass
@@ -25,26 +25,29 @@ CFG = dict(tick=3.0, hog_cpu=20.0, hog_ticks=3, cpu_busy=0.75, calm_ticks=3, dem
            pause_cooldown=120, max_demote=40, max_pause=0, pageout_hot=60.0, ai_every=120, ai_timeout=40, adaptive=True, scan_at=0.72, saver=False)
 
 # Never touched, by command text. System daemons are excluded by path unless on the BG_OK list.
-NEVER = re.compile(r"/(WindowServer|kernel_task|launchd|loginwindow|Finder|Dock|SystemUIServer|coreaudiod|bluetoothd|sshd|tmux|Terminal|iTerm2?|Activity Monitor)(\.app|$| )|steady\.py")
+NEVER = re.compile(r"/(WindowServer|kernel_task|launchd|loginwindow|Finder|Dock|SystemUIServer|coreaudiod|bluetoothd|sshd|tmux|Terminal|iTerm2?|Activity Monitor)(\.app|$| )|monitored\.py")
 SYSTEM_PATH = re.compile(r"^(/System/|/usr/|/sbin/|/bin/|/Library/Apple/)")
 BG_OK = {"photoanalysisd", "mediaanalysisd", "mdworker_shared", "mds_stores", "backupd", "suggestd", "parsecd", "siriknowledged", "cloudd"}
 # Work that matters: never demoted, and so is everything under it. Extend as needed (the AI can add names for the session).
-PRIORITY = re.compile(r"ollama|llama-server|Spotify|zoom\.us|FaceTime|Discord|OBS|Logic Pro|GarageBand|Ableton|/Music\.app/|Microsoft Teams|/Claude\.app/|\.local/share/claude/versions|/claude( |$)|pytest|cargo|rustc|\bnpm run\b|vite|webpack|esbuild|\btsc\b")
+PRIORITY = re.compile(r"xcodebuild|swift-frontend|clang|ffmpeg|HandBrake|Final Cut|Premiere|DaVinci|Blender|Compressor|Docker|Parallels|VMware|UTM|qemu|postgres|mysqld|mongod|redis-server|nginx|gradle|\bcmake\b|\bninja\b|\bmake\b|ollama|llama-server|Spotify|zoom\.us|FaceTime|Discord|OBS|Logic Pro|GarageBand|Ableton|/Music\.app/|Microsoft Teams|/Claude\.app/|\.local/share/claude/versions|/claude( |$)|pytest|cargo|rustc|\bnpm run\b|vite|webpack|esbuild|\btsc\b")
 
 def _user_protect():
-    """Programs the user asked Steady never to touch: one name per line in protect.txt (a command containing the name is protected)."""
+    """Programs the user asked Activity Monitored never to touch: one name per line in protect.txt (a command containing the name is protected)."""
     try: items = [l.strip() for l in open(DIR + "/protect.txt") if l.strip() and not l.startswith("#")]
     except OSError: return None
     return re.compile("|".join(re.escape(i) for i in items)) if items else None
 
 def run(args, t=5):
     try:
-        return subprocess.run(args, capture_output=True, text=True, timeout=t).stdout
+        return subprocess.run(args, capture_output=True, text=True, errors="replace", timeout=t).stdout
     except Exception:
         return ""
 
 def now(): return time.time()
 def jl(path, obj):
+    try:
+        if os.path.getsize(path) > 4_000_000: os.replace(path, path + ".1")  # at most two files of 4 MB per log
+    except OSError: pass
     with open(path, "a") as f: f.write(json.dumps(obj, separators=(",", ":")) + "\n")
 def jload(path, default):
     try:
@@ -71,8 +74,8 @@ def pname(cmd):
 
 _last_po = [None, None]
 def memory_slow():
-    if os.environ.get("STEADY_FAKE_LEVEL"):
-        return int(os.environ["STEADY_FAKE_LEVEL"]), 0.9, float(os.environ.get("STEADY_FAKE_PAGEOUT", "0"))
+    if os.environ.get("MONITORED_FAKE_LEVEL"):
+        return int(os.environ["MONITORED_FAKE_LEVEL"]), 0.9, float(os.environ.get("MONITORED_FAKE_PAGEOUT", "0"))
     lvl = int(run(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"]).strip() or 1)
     m = re.findall(r"([\d.]+)M", run(["sysctl", "-n", "vm.swapusage"]))
     swap = float(m[1]) / float(m[0]) if len(m) >= 2 and float(m[0]) else 0.0
@@ -98,7 +101,7 @@ def pressure_level():
     return v.value if _LIB and _LIB.sysctlbyname(b"kern.memorystatus_vm_pressure_level", ctypes.byref(v), ctypes.byref(sz), None, 0) == 0 else None
 _swap_c = [0.0, 0.0]
 def memory():
-    if os.environ.get("STEADY_FAKE_LEVEL") or _LIB is None: return memory_slow()
+    if os.environ.get("MONITORED_FAKE_LEVEL") or _LIB is None: return memory_slow()
     lvl, po_total = pressure_level(), vm_pageouts()
     if lvl is None or po_total is None: return memory_slow()
     t = now()
@@ -193,7 +196,7 @@ def revert_all(why="revert-all"):
 LEAN_FLAGS = ["--setting-sources", "", "--strict-mcp-config", "--exclude-dynamic-system-prompt-sections", "--tools", "", "--max-turns", "1", "--disable-slash-commands", "--no-session-persistence"]
 
 def ai_cmd():
-    if os.environ.get("STEADY_AI_CMD"): return os.environ["STEADY_AI_CMD"].split()
+    if os.environ.get("MONITORED_AI_CMD"): return os.environ["MONITORED_AI_CMD"].split()
     for c in (os.path.join(HOME, ".local/bin/claude"), shutil.which("claude")):
         if c and os.path.exists(c): return [c, "-p", "--model", "haiku"] + LEAN_FLAGS
     return None
@@ -212,7 +215,7 @@ def llm_json(prompt):
         with os.fdopen(fd, "w") as f: f.write(prompt)  # exactly what the last model call received, for `ctl.py privacy`
     except OSError: pass
     try:
-        out = subprocess.run(cmd + [prompt], capture_output=True, text=True, timeout=CFG["ai_timeout"], stdin=subprocess.DEVNULL).stdout
+        out = subprocess.run(cmd + [prompt], capture_output=True, text=True, errors="replace", timeout=CFG["ai_timeout"], stdin=subprocess.DEVNULL).stdout
         m = re.search(r"\{.*\}", out, re.S)
         return json.loads(m.group(0)) if m else None
     except Exception:
@@ -295,6 +298,7 @@ class Mon:
         self.res = (s, valid_plan(raw, cands), cands, [str(x)[:160] for x in (raw or {}).get("advice", [])[:3]]) if raw is not None else (s, None, cands, [])
 
     def tick(self):
+        if os.environ.get("MONITORED_FAULT"): raise RuntimeError("fault injection (tests only)")
         use = self.cheap(); lvl, swap, po = memory(); t = now(); self.n += 1
         if not (use is None or use >= CFG["scan_at"] or journal() or lvl >= 4 or (lvl >= 2 and po >= CFG["pageout_hot"])): return self.light(use, lvl, swap, po, t)
         procs = sample(); fg_pid, fg = foreground(procs)
@@ -304,6 +308,8 @@ class Mon:
         cpu_frac = (sum(p["cpu"] for p in procs.values()) - sum(procs[k]["cpu"] for k in dem) + sum(e.get("cpu", 0.0) for e in dem.values())) / (100.0 * NCPU)
         cpu_hot, mem_hot = cpu_frac >= CFG["cpu_busy"], (lvl >= 4 or (lvl >= 2 and po >= CFG["pageout_hot"]))
         protected, priority = classify(procs, fg_pid, self.ai_protect)
+        for k in list(journal()):  # a slowed program that is now protected (you switched to it) is restored at once
+            if int(k) in protected: undo(int(k), "protected")
         for x in [x for x in self.streak if x not in procs]: del self.streak[x]
         cands = []
         for p in procs.values():
@@ -379,19 +385,27 @@ def cmd_run(args):
     if "--ai" in args: mode = args[args.index("--ai") + 1]
     if "--ticks" in args: ticks = int(args[args.index("--ticks") + 1])
     if "--tick" in args: CFG["tick"] = float(args[args.index("--tick") + 1]); CFG["adaptive"] = False
-    for k in ("hog_ticks", "ai_every"):
+    for k in ("hog_ticks", "ai_every", "hog_cpu"):  # hog_cpu: tests lower it, because macOS ps shows a new process's CPU use only after about 10 s
         if "--" + k in args: CFG[k] = float(args[args.index("--" + k) + 1])
     import fcntl
     lk = open(DIR + "/lock", "w")
     try: fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError: return print("steady is already running for", DIR)  # one monitor per state folder
+    except OSError: return print("monitored is already running for", DIR)  # one monitor per state folder
     revert_all("startup")
     def bye(*a): revert_all("exit"); sys.exit(0)
     signal.signal(signal.SIGINT, bye); signal.signal(signal.SIGTERM, bye)
     m, n = Mon(mode), 0
     try:
+        errs = 0
         while ticks is None or n < ticks:
-            t0 = now(); m.tick(); n += 1
+            t0 = now()
+            try: m.tick(); errs = 0
+            except Exception as e:  # one bad tick (full disk, odd process line) must not stop the monitor; 10 in a row means something is wrong, so exit and let the login item restart it
+                errs += 1
+                try: jl(F_EVENTS, dict(t=int(now()), ev="error", msg=repr(e)[:200]))
+                except Exception: pass
+                if errs >= 10: sys.exit(1)
+            n += 1
             time.sleep(max(0.2, m.sleep - (now() - t0)))
     finally:
         revert_all("exit")
@@ -411,16 +425,16 @@ def cmd_gate(args):
     mw = 120.0
     if "--max-wait" in args: mw = float(args[args.index("--max-wait") + 1])
     cmd = args[args.index("--") + 1:] if "--" in args else []
-    if not cmd: sys.exit("usage: steady.py gate [--max-wait S] -- CMD ...")
+    if not cmd: sys.exit("usage: monitored.py gate [--max-wait S] -- CMD ...")
     t0, held = now(), False
     while True:
         h, src = hold_now()
         if not h: break
         held = True
-        if now() - t0 >= mw: sys.stderr.write("steady gate: still thrashing after %.0f s, starting anyway\n" % (now() - t0)); break
+        if now() - t0 >= mw: sys.stderr.write("monitored gate: still thrashing after %.0f s, starting anyway\n" % (now() - t0)); break
         time.sleep(2)
     jl(F_EVENTS, dict(t=int(now()), ev="gate", waited=round(now() - t0, 1), held=held, cmd=cmd[0]))
-    if held: sys.stderr.write("steady gate: waited %.0f s\n" % (now() - t0))
+    if held: sys.stderr.write("monitored gate: waited %.0f s\n" % (now() - t0))
     os.execvp(cmd[0], cmd)
 
 def cmd_report(args):
@@ -442,7 +456,7 @@ def cmd_report(args):
 
 # ---------- install, settings, friendly commands ----------
 __version__ = "0.1.0"
-LABEL = os.environ.get("STEADY_LABEL", "com.steady.monitor")
+LABEL = os.environ.get("MONITORED_LABEL", "com.activitymonitored.agent")
 PLIST = os.path.join(HOME, "Library", "LaunchAgents", LABEL + ".plist")
 F_SET = DIR + "/settings.json"
 SELF = os.path.abspath(__file__)
@@ -465,7 +479,7 @@ def stop_agent():
 
 def write_plist(s):
     import plistlib
-    args = [stable_python(), DIR + "/steady.py", "run", "--ai", "auto" if s["ai"] else "off"]
+    args = [stable_python(), DIR + "/monitored.py", "run", "--ai", "auto" if s["ai"] else "off"]
     if s["mode"] == "watch": args.append("--dry")
     if s["battery_saver"]: args.append("--saver")
     d = {"Label": LABEL, "ProgramArguments": args, "RunAtLoad": True, "KeepAlive": {"SuccessfulExit": False}, "ThrottleInterval": 30, "ProcessType": "Adaptive",
@@ -476,13 +490,13 @@ def write_plist(s):
 
 def apply_settings():
     s = settings(); stop_agent()
-    if s["mode"] == "off": print("Steady is off. Nothing is running and nothing is slowed."); return 0
-    if not os.path.exists(DIR + "/steady.py"): print("Steady is not installed. Run: python3 steady.py install"); return 1
+    if s["mode"] == "off": print("Activity Monitored is off. Nothing is running and nothing is slowed."); return 0
+    if not os.path.exists(DIR + "/monitored.py"): print("Activity Monitored is not installed. Run: python3 monitored.py install"); return 1
     write_plist(s); r = lc("bootstrap", "gui/%d" % ME, PLIST)
-    if r.returncode != 0: print("macOS refused to start Steady:", r.stderr.strip()); return 1
+    if r.returncode != 0: print("macOS refused to start Activity Monitored:", r.stderr.strip()); return 1
     time.sleep(3)
-    if s["mode"] == "watch": print("Steady is watching only. It logs what it would do and changes nothing.")
-    else: print("Steady is on. It slows busy background programs only while your Mac is overloaded, then restores them.")
+    if s["mode"] == "watch": print("Activity Monitored is watching only. It logs what it would do and changes nothing.")
+    else: print("Activity Monitored is on. It slows busy background programs only while your Mac is overloaded, then restores them.")
     print("AI judgment: %s. Battery saver: %s. Running: %s." % ("on" if s["ai"] else "off", "on" if s["battery_saver"] else "off", "yes" if running() else "no"))
     return 0
 
@@ -492,49 +506,49 @@ def cmd_install(args):
     if "--ai" in args: s["ai"] = args[args.index("--ai") + 1] == "on"
     if s["mode"] not in ("on", "watch", "off"): print("mode must be on, watch or off"); return 1
     os.makedirs(DIR, exist_ok=True); os.chmod(DIR, 0o700)
-    if os.path.abspath(DIR + "/steady.py") != SELF: shutil.copy(SELF, DIR + "/steady.py")
-    shim = DIR + "/steady"
-    with open(shim, "w") as f: f.write('#!/bin/bash\nexec "%s" "%s/steady.py" "$@"\n' % (stable_python(), DIR))
+    if os.path.abspath(DIR + "/monitored.py") != SELF: shutil.copy(SELF, DIR + "/monitored.py")
+    shim = DIR + "/monitored"
+    with open(shim, "w") as f: f.write('#!/bin/bash\nexec "%s" "%s/monitored.py" "$@"\n' % (stable_python(), DIR))
     os.chmod(shim, 0o755)
-    link = os.path.join(HOME, ".local", "bin", "steady")
+    link = os.path.join(HOME, ".local", "bin", "monitored")
     try:
         if os.path.isdir(os.path.dirname(link)) and not os.path.lexists(link): os.symlink(shim, link)
     except OSError: pass
     jsave(F_SET, s); rc = apply_settings()
-    cmd = "steady" if shutil.which("steady") else shim.replace(HOME, "~")
+    cmd = "monitored" if shutil.which("monitored") else shim.replace(HOME, "~")
     print("\nCheck it any time:  %s status\nTurn it off:        %s off\nRemove it:          %s uninstall" % (cmd, cmd, cmd))
     return rc
 
 def cmd_uninstall(args):
     stop_agent()
     if os.path.exists(PLIST): os.remove(PLIST)
-    link = os.path.join(HOME, ".local", "bin", "steady")
+    link = os.path.join(HOME, ".local", "bin", "monitored")
     try:
-        if os.path.islink(link) and os.path.realpath(link) == os.path.realpath(DIR + "/steady"): os.remove(link)
+        if os.path.islink(link) and os.path.realpath(link) == os.path.realpath(DIR + "/monitored"): os.remove(link)
     except OSError: pass
-    for f in ("steady.py", "steady", "settings.json"):
+    for f in ("monitored.py", "monitored", "settings.json"):
         try: os.remove(DIR + "/" + f)
         except OSError: pass
     if "--purge" in args: shutil.rmtree(DIR, ignore_errors=True)
-    print("Steady is removed. Nothing is running and nothing is slowed." + ("" if "--purge" in args else " Logs stay in %s (add --purge to delete them)." % DIR.replace(HOME, "~")))
+    print("Activity Monitored is removed. Nothing is running and nothing is slowed." + ("" if "--purge" in args else " Logs stay in %s (add --purge to delete them)." % DIR.replace(HOME, "~")))
 
 def set_key(k, v):
     s = settings(); s[k] = v; os.makedirs(DIR, exist_ok=True); jsave(F_SET, s); return apply_settings()
 
 def cmd_toggle(key, args):
-    if args[:1] not in (["on"], ["off"]): print("usage: steady %s on|off" % ("ai" if key == "ai" else "battery")); return 1
+    if args[:1] not in (["on"], ["off"]): print("usage: monitored %s on|off" % ("ai" if key == "ai" else "battery")); return 1
     return set_key(key, args[0] == "on")
 
 def cmd_protect(args):
-    if not args: print("usage: steady protect NAME"); return 1
+    if not args: print("usage: monitored protect NAME"); return 1
     with open(DIR + "/protect.txt", "a") as f: f.write(" ".join(args) + "\n")
-    print("Steady will never touch programs whose command contains '%s'." % " ".join(args)); return 0
+    print("Activity Monitored will never touch programs whose command contains '%s'." % " ".join(args)); return 0
 
 def cmd_status(args):
     s, st = settings(), jload(F_STATUS, {})
     fresh = bool(st) and now() - st.get("ts", 0) < 30
     word = {"on": "on", "watch": "watching only", "off": "off"}.get(s["mode"], s["mode"])
-    print("Steady is %s (AI %s, battery saver %s). %s" % (word, "on" if s["ai"] else "off", "on" if s["battery_saver"] else "off", "Running." if (fresh or running()) else "Not running."))
+    print("Activity Monitored is %s (AI %s, battery saver %s). %s" % (word, "on" if s["ai"] else "off", "on" if s["battery_saver"] else "off", "Running." if (fresh or running()) else "Not running."))
     if fresh:
         lvl = {1: "normal", 2: "warning", 4: "critical"}.get(st.get("level"), str(st.get("level")))
         print("CPU busy: %d%%. Memory pressure: %s. Front app: %s." % (round(100 * st.get("cpu_frac", 0)), lvl, st.get("fg") or "unknown"))
@@ -553,7 +567,7 @@ def cmd_status(args):
 
 def cmd_privacy(args):
     ai = settings()["ai"]
-    print("AI judgment is %s." % ("ON: for an unfamiliar situation, Steady sends names, CPU and memory of the busiest programs you own, the front app's name, and (if asked) a program's command line and folder, with secrets and your home path removed, to the `claude` program on this Mac, which uses your own Claude login" if ai else "OFF (default): nothing leaves your Mac and no account is used"))
+    print("AI judgment is %s." % ("ON: for an unfamiliar situation, Activity Monitored sends names, CPU and memory of the busiest programs you own, the front app's name, and (if asked) a program's command line and folder, with secrets and your home path removed, to the `claude` program on this Mac, which uses your own Claude login" if ai else "OFF (default): nothing leaves your Mac and no account is used"))
     p = os.path.join(DIR, "last_prompt.txt")
     print("Exactly what the last model call received:\n" + (open(p).read() if os.path.exists(p) else "(no model call yet)"))
 
