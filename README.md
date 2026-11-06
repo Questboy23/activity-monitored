@@ -11,7 +11,16 @@
 
 ## Install (about 30 seconds)
 
-Open Terminal (press Cmd+Space, type `Terminal`, press Return), paste this line, press Return:
+Open Terminal (press Cmd+Space, type `Terminal`, press Return), paste these lines, press Return after each:
+
+```
+git clone https://github.com/Questboy23/activity-monitored
+cd activity-monitored
+less install.sh      # read the script first, press q to leave
+bash install.sh
+```
+
+Faster, if you trust the author: this one line runs the script without you reading it first.
 
 ```
 curl -fsSL https://raw.githubusercontent.com/Questboy23/activity-monitored/main/install.sh | bash
