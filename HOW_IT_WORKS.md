@@ -32,7 +32,7 @@ It never kills a program, edits a file, sends anything over the network (with AI
 - **macOS alone** shares time by internal rules and has no setting for "slow the programs I do not care about while I work".
 - **App Tamer** (paid) gives a program background priority whenever it is not the front app, according to its developer. The trigger is where you are looking. Activity Monitored's trigger is real overload, so an idle or lightly used Mac is never touched.
 - **Process Lasso** (Windows only) lowers the priority of processes that hog the processor. Activity Monitored applies the same idea on macOS.
-- **Activity Monitored adds:** protection for work you started on purpose, an automatic undo that survives a crash, optional AI judgment with stored answers, and a free open script (once public).
+- **Activity Monitored adds:** protection for work you started on purpose, an automatic undo that survives a crash, optional AI judgment with stored answers, and a free open script.
 - **Not measured:** a head-to-head comparison with App Tamer. The only benchmark so far is synthetic: a job finished in 24.2 s instead of 39.3 s while 24 background processes competed (median of 3 runs each).
 
 ## Definitions
