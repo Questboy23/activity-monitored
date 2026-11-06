@@ -3,7 +3,9 @@
   <img alt="Activity Monitored: keeps a Mac responsive when it is overloaded" src="art/banner-light.svg" width="100%">
 </picture>
 
-# Activity Monitored
+# Activity Monitored: keeps a Mac responsive when it is overloaded.
+
+**Synthetic overload test: a 10-process job finished in 24.2 s instead of 39.3 s (one Mac, best case).**
 
 **Activity Monitored keeps your Mac responsive when it is overloaded.** While too many programs fight for the CPU, it lowers the priority of the busy background ones, then restores them. Every change is undone automatically.
 
