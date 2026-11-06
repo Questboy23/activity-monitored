@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="art/banner-dark.svg">
+  <img alt="Activity Monitored: keeps a Mac responsive when it is overloaded" src="art/banner-light.svg" width="100%">
+</picture>
+
 # Activity Monitored
 
 **Activity Monitored keeps your Mac responsive when it is overloaded.** While too many programs fight for the CPU, it lowers the priority of the busy background ones, then restores them. Every change is undone automatically.
