@@ -113,4 +113,14 @@ names_ok = (_m.pname("gitleaks dir /Users/x/mirrors/edge --no-banner") == "gitle
             and _m.pname("/usr/bin/python3 /tmp/a/b.py -x") == "python3")
 check("program names ignore path arguments", names_ok)
 check("rsync is protected by default", bool(_m.PRIORITY.search("rsync -a /src /dst")))
+# a refreshed demotion keeps exactly one undo timer, and undo cancels it (old timers used to restore the program early)
+_t = subprocess.Popen(["sleep", "300"]); _p = dict(pid=_t.pid, cmd="sleep 300 " + MARK, cpu=50.0)
+_m.apply("demote", _p, 300); _first = _m.journal()[str(_t.pid)]["timer"]; time.sleep(0.3)
+_m.apply("demote", _p, 300); _second = _m.journal()[str(_t.pid)]["timer"]; time.sleep(0.3)
+def _alive(x):
+    try: os.kill(x, 0); return sh("ps", "-o", "stat=", "-p", str(x)).stdout.strip()[:1] not in ("", "Z")
+    except OSError: return False
+_one = (not _alive(_first)) and _alive(_second)
+_m.undo(_t.pid, "test"); time.sleep(0.3); _t.kill()
+check("a refreshed demotion keeps one undo timer and undo cancels it", _one and not _alive(_second), "first %s second %s" % (_first, _second))
 print("\n%d of %d passed" % (sum(results), len(results)))

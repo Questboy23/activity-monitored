@@ -155,7 +155,16 @@ def eligible(p):
 
 # ---------- executor: every action is undoable and carries its own OS-level undo timer ----------
 def dead_man(undo, ttl):
-    subprocess.Popen(["/bin/sh", "-c", "sleep %d; %s" % (ttl, undo)], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    """Starts an OS-level undo timer in its own process group and returns its id, so a refresh or undo can cancel it."""
+    return subprocess.Popen(["/bin/sh", "-c", "sleep %d; %s" % (ttl, undo)], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).pid
+
+def cancel_timer(e):
+    """Stops an old undo timer. Without this, a timer from an earlier refresh restores a still-demoted program early,
+    or later runs on a reused pid."""
+    tp = (e or {}).get("timer")
+    if tp:
+        try: os.killpg(int(tp), signal.SIGKILL)
+        except (OSError, ValueError): pass
 
 def journal(): return jload(F_JOURNAL, {})
 
@@ -168,13 +177,14 @@ def apply(act, p, ttl):
         return False
     if act == "demote":
         if subprocess.run(["taskpolicy", "-b", "-p", str(pid)], capture_output=True).returncode != 0: return False
-        dead_man("taskpolicy -B -p %d" % pid, ttl)
+        timer = dead_man("taskpolicy -B -p %d" % pid, ttl)
     elif act == "pause":
         try: os.kill(pid, signal.SIGSTOP)
         except OSError: return False
-        dead_man("kill -CONT %d" % pid, ttl)
+        timer = dead_man("kill -CONT %d" % pid, ttl)
     old = J.get(str(pid)); refresh = bool(old and old["act"] == act)
-    J[str(pid)] = dict(act=act, name=pname(p["cmd"]), t=now(), ttl=ttl, cpu=(old.get("cpu", p["cpu"]) if refresh else p["cpu"]))
+    cancel_timer(old)  # only the newest timer may end this action
+    J[str(pid)] = dict(act=act, name=pname(p["cmd"]), t=now(), ttl=ttl, cpu=(old.get("cpu", p["cpu"]) if refresh else p["cpu"]), timer=timer)
     jsave(F_JOURNAL, J)
     if not refresh: jl(F_EVENTS, dict(t=int(now()), ev=act, pid=pid, name=pname(p["cmd"]), cpu=p["cpu"]))
     return True
@@ -182,6 +192,7 @@ def apply(act, p, ttl):
 def undo(pid, why):
     J = journal(); e = J.pop(str(pid), None)
     if e is None: return
+    cancel_timer(e)
     if e["act"] == "demote": subprocess.run(["taskpolicy", "-B", "-p", str(pid)], capture_output=True)
     else:
         try: os.kill(int(pid), signal.SIGCONT)
@@ -321,7 +332,7 @@ class Mon:
         hogs = [p for p in cands if self.streak[p["pid"]] >= CFG["hog_ticks"]]
         J = journal()
         for pid, e in list(J.items()):  # housekeeping: forget dead pids, end pauses
-            if int(pid) not in procs: J.pop(pid); jsave(F_JOURNAL, J)
+            if int(pid) not in procs: cancel_timer(J.pop(pid)); jsave(F_JOURNAL, J)
             elif e["act"] == "pause" and t - e["t"] >= e["ttl"]: undo(int(pid), "pause ttl")
         J = journal()
         if self.res:  # consume a finished AI answer
