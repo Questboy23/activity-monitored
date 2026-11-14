@@ -133,4 +133,16 @@ check("status reports disk free and the warning", "Disk free:" in r.stdout and "
 dw2 = tempfile.mkdtemp(); sh(sys.executable, SM, "run", "--ticks", "3", "--tick", "0.5", "--ai", "off", env={"MONITORED_DIR": dw2, "MONITORED_DISK_MIN_GB": "0", "MONITORED_NO_NOTIFY": "1"}, t=60)
 check("enough disk produces no disk warning", not [e for e in jl(dw2 + "/events.jsonl") if e.get("kind") == "disk"])
 
+# memory and repeat-hog warnings fire once each and stay rate-limited; ps runs once, not every tick
+dm = tempfile.mkdtemp(); r = sh(sys.executable, "-c", """
+import importlib.util, sys
+s = importlib.util.spec_from_file_location("m", sys.argv[1]); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+n = [0]; real = m.sample
+def counted(): n[0] += 1; return real()
+m.sample = counted; m._demotes.extend([(m.now(), "hog x")] * 10)
+for _ in range(30): m.warn_check(2, 0.95, False)
+print(n[0])""", SM, env={"MONITORED_DIR": dm, "MONITORED_NO_NOTIFY": "1", "MONITORED_DISK_MIN_GB": "0"})
+kinds = [e["kind"] for e in jl(dm + "/events.jsonl") if e.get("ev") == "warn"]
+check("memory and repeat warnings fire once each, ps sampled once", sorted(kinds) == ["memory", "repeat:hog x"] and r.stdout.strip() == "1", (kinds, r.stdout.strip(), r.stderr[-200:]))
+
 print("\n%d of %d passed" % (sum(results), len(results)))

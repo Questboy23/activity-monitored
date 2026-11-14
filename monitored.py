@@ -181,7 +181,7 @@ def notify(key, msg):  # at most one warning per kind every 30 minutes
     if t - _warned.get(key, 0) < WARN["every"]: return False
     _warned[key] = t; jl(F_EVENTS, dict(t=int(t), ev="warn", kind=key, msg=msg))
     if not os.environ.get("MONITORED_NO_NOTIFY"):
-        try: subprocess.Popen(["/usr/bin/osascript", "-e", "display notification %s with title \"Activity Monitored\"" % json.dumps(msg)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try: subprocess.Popen(["/usr/bin/osascript", "-e", "on run a", "-e", 'display notification (item 1 of a) with title "Activity Monitored"', "-e", "end run", msg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError: pass
     return True
 def warn_check(lvl, swap, mem_hot):
@@ -191,7 +191,7 @@ def warn_check(lvl, swap, mem_hot):
         if gb is not None and gb < WARN["disk_min_gb"]:
             notify("disk", "Disk nearly full: %.0f GB free. macOS needs free space for swap; below ~20 GB apps can freeze. Free some space." % gb)
     _wstate["mem"] = _wstate["mem"] + 1 if (mem_hot or (lvl is not None and lvl >= 2 and swap >= WARN["swap_full"])) else 0
-    if _wstate["mem"] >= WARN["mem_ticks"]:
+    if _wstate["mem"] >= WARN["mem_ticks"] and t - _warned.get("memory", 0) >= WARN["every"]:  # check the limit first: ps is costly while memory is short
         top = sorted(sample().values(), key=lambda p: -p["rss"])[:3]
         if notify("memory", "Memory exhausted (swap %d%% full). Biggest: %s. Quit one to avoid a freeze." % (round(100 * swap), ", ".join("%s %.1f GB" % (pname(p["cmd"]), p["rss"] / 1e9) for p in top))): _wstate["mem"] = 0
     del _demotes[:max(0, len(_demotes) - 500)]
