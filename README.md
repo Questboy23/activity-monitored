@@ -7,7 +7,7 @@
 
 **Synthetic overload test: a 10-process job finished in 24.2 s instead of 39.3 s (one Mac, best case).**
 
-**Activity Monitored keeps your Mac responsive when it is overloaded.** While too many programs fight for the CPU, it lowers the priority of the busy background ones, then restores them. Every change is undone automatically.
+**Activity Monitored keeps your Mac responsive when it is overloaded.** While too many programs fight for the CPU, it lowers the priority of the busy background ones, then restores them. Every change is undone automatically. It also warns you when the disk is nearly full, memory is exhausted, or one program keeps hogging the CPU, because slowing programs cannot fix those.
 
 ## Install (about 30 seconds)
 

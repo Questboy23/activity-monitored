@@ -123,4 +123,14 @@ def _alive(x):
 _one = (not _alive(_first)) and _alive(_second)
 _m.undo(_t.pid, "test"); time.sleep(0.3); _t.kill()
 check("a refreshed demotion keeps one undo timer and undo cancels it", _one and not _alive(_second), "first %s second %s" % (_first, _second))
+# warnings: a disk under the threshold produces one disk warning (rate-limited), and status shows disk free and the warning
+dw = tempfile.mkdtemp(); env = {"MONITORED_DIR": dw, "MONITORED_DISK_MIN_GB": "1000000", "MONITORED_NO_NOTIFY": "1"}
+sh(sys.executable, SM, "run", "--ticks", "3", "--tick", "0.5", "--ai", "off", env=env, t=60)
+w = [e for e in jl(dw + "/events.jsonl") if e.get("ev") == "warn"]
+check("low disk produces exactly one rate-limited warning", len(w) == 1 and w[0]["kind"] == "disk" and "GB free" in w[0]["msg"], w)
+r = sh(sys.executable, SM, "status", env=env)
+check("status reports disk free and the warning", "Disk free:" in r.stdout and "Warning: Disk nearly full" in r.stdout, r.stdout[-200:])
+dw2 = tempfile.mkdtemp(); sh(sys.executable, SM, "run", "--ticks", "3", "--tick", "0.5", "--ai", "off", env={"MONITORED_DIR": dw2, "MONITORED_DISK_MIN_GB": "0", "MONITORED_NO_NOTIFY": "1"}, t=60)
+check("enough disk produces no disk warning", not [e for e in jl(dw2 + "/events.jsonl") if e.get("kind") == "disk"])
+
 print("\n%d of %d passed" % (sum(results), len(results)))

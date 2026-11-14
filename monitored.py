@@ -169,6 +169,37 @@ def cancel_timer(e):
 def journal(): return jload(F_JOURNAL, {})
 
 DRY, _would = False, {}
+
+# Warnings: things slowing a process cannot fix (full disk, memory exhausted, a program that keeps coming back). It tells you; it still never kills.
+WARN = dict(disk_min_gb=float(os.environ.get("MONITORED_DISK_MIN_GB", "20")), swap_full=0.9, mem_ticks=10, repeat_n=10, every=1800)
+_demotes, _warned, _wstate = [], {}, dict(disk_t=0.0, mem=0)
+def disk_free_gb():
+    try: v = os.statvfs(HOME); return v.f_bavail * v.f_frsize / 1e9
+    except OSError: return None
+def notify(key, msg):  # at most one warning per kind every 30 minutes
+    t = now()
+    if t - _warned.get(key, 0) < WARN["every"]: return False
+    _warned[key] = t; jl(F_EVENTS, dict(t=int(t), ev="warn", kind=key, msg=msg))
+    if not os.environ.get("MONITORED_NO_NOTIFY"):
+        try: subprocess.Popen(["/usr/bin/osascript", "-e", "display notification %s with title \"Activity Monitored\"" % json.dumps(msg)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError: pass
+    return True
+def warn_check(lvl, swap, mem_hot):
+    t = now()
+    if t - _wstate["disk_t"] >= 60:
+        _wstate["disk_t"] = t; gb = disk_free_gb()
+        if gb is not None and gb < WARN["disk_min_gb"]:
+            notify("disk", "Disk nearly full: %.0f GB free. macOS needs free space for swap; below ~20 GB apps can freeze. Free some space." % gb)
+    _wstate["mem"] = _wstate["mem"] + 1 if (mem_hot or (lvl is not None and lvl >= 2 and swap >= WARN["swap_full"])) else 0
+    if _wstate["mem"] >= WARN["mem_ticks"]:
+        top = sorted(sample().values(), key=lambda p: -p["rss"])[:3]
+        if notify("memory", "Memory exhausted (swap %d%% full). Biggest: %s. Quit one to avoid a freeze." % (round(100 * swap), ", ".join("%s %.1f GB" % (pname(p["cmd"]), p["rss"] / 1e9) for p in top))): _wstate["mem"] = 0
+    del _demotes[:max(0, len(_demotes) - 500)]
+    recent = defaultdict(int)
+    for tt, n in _demotes:
+        if t - tt < 3600: recent[n] += 1
+    for n, c in recent.items():
+        if c >= WARN["repeat_n"]: notify("repeat:" + n, "%s keeps hogging the CPU (slowed %d times this hour). Slowing does not fix it; quit or fix it." % (n, c))
 def apply(act, p, ttl):
     pid, J = p["pid"], journal()
     if DRY:  # log what would happen, change nothing
@@ -186,7 +217,9 @@ def apply(act, p, ttl):
     cancel_timer(old)  # only the newest timer may end this action
     J[str(pid)] = dict(act=act, name=pname(p["cmd"]), t=now(), ttl=ttl, cpu=(old.get("cpu", p["cpu"]) if refresh else p["cpu"]), timer=timer)
     jsave(F_JOURNAL, J)
-    if not refresh: jl(F_EVENTS, dict(t=int(now()), ev=act, pid=pid, name=pname(p["cmd"]), cpu=p["cpu"]))
+    if not refresh:
+        jl(F_EVENTS, dict(t=int(now()), ev=act, pid=pid, name=pname(p["cmd"]), cpu=p["cpu"]))
+        if act == "demote": _demotes.append((now(), pname(p["cmd"])))
     return True
 
 def undo(pid, why):
@@ -294,6 +327,7 @@ class Mon:
         return use
 
     def light(self, use, lvl, swap, po, t):  # nothing is contended: no process scan, no program spawned except one foreground check every 10 s
+        warn_check(lvl, swap, False)
         if t - self.fg_t >= 10:
             self.fg_t = t; fg = fg_light()
             if fg != self.last_fg: jl(F_FG, dict(t=int(t), app=fg)); self.last_fg = fg
@@ -377,7 +411,7 @@ class Mon:
             if self.calm >= CFG["calm_ticks"] and J:
                 for pid, e in list(J.items()):
                     if t - e["t"] >= 30: undo(int(pid), "calm")  # minimum hold 30 s
-        J = journal()
+        J = journal(); warn_check(lvl, swap, mem_hot)
         calm = cpu_frac < CFG["scan_at"] and not mem_hot and not J  # calm: check less often (6 s on power, 10 s on battery); busy: every 3 s
         self.sleep = ((10.0 if self.on_battery() else 6.0) if calm else (5.0 if CFG["saver"] and self.on_battery() else CFG["tick"])) if CFG["adaptive"] else CFG["tick"]
         ct = sum(os.times()[:4]); ovh = 100.0 * (ct - self.c_prev) / max(1e-6, t - self.t_prev); self.c_prev, self.t_prev = ct, t
@@ -576,6 +610,9 @@ def cmd_status(args):
         if e.get("ev") in ("demote", "would_demote"): names[e.get("name", "?")] += 1
     print("Last 24 hours: %d slowdowns%s." % (sum(names.values()), (", most often " + ", ".join("%s (%d)" % kv for kv in sorted(names.items(), key=lambda kv: -kv[1])[:3])) if names else ""))
     for a in st.get("advice", [])[:3]: print("Suggestion (never done automatically): " + a)
+    gb = disk_free_gb()
+    if gb is not None: print("Disk free: %.0f GB%s." % (gb, " (too low: below %d GB apps can freeze)" % WARN["disk_min_gb"] if gb < WARN["disk_min_gb"] else ""))
+    for e in [e for e in ev if e.get("ev") == "warn"][-3:]: print("Warning: " + e.get("msg", ""))
 
 def cmd_privacy(args):
     ai = settings()["ai"]

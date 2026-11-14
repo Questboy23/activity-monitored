@@ -12,7 +12,8 @@ A Mac has a fixed amount of processor time. When more programs ask for it than e
 4. **Slow it down.** It marks the culprit as a background program. macOS then gives it lower priority, runs it on the low-power cores of an Apple silicon Mac, and slows its disk and network use. Nothing is killed, paused, or changed in the program.
 5. **Undo it.** After the Mac has been calm for three checks (and the slowdown is at least 30 seconds old), the program is restored. A second timer, set at the moment of the slowdown, restores it after 90 seconds no matter what, even if Activity Monitored crashes or is removed. If you switch to a slowed program, it is restored within one check. While the overload continues, the slowdown is renewed each minute.
 6. **Optional AI judgment (off by default).** For a situation it has not seen, it can send the names and usage of the busiest programs to a Claude model through your own `claude` login. The model answers slow, leave alone, or a suggestion for you. Answers are stored by program name and reused with no further calls. The code accepts only program numbers from the list and only the reversible actions.
-7. **Hold new work.** `monitored gate -- COMMAND` waits (at most 30 seconds) until memory is not thrashing, then starts the command.
+7. **Warn about what slowing cannot fix.** It shows a macOS notification, at most once per 30 minutes for each kind, when free disk space drops below 20 GB (macOS needs it for swap, and a full disk freezes apps), when memory stays exhausted (swap over 90% full) for about 10 checks, naming the 3 biggest programs, or when one program is slowed 10 or more times in an hour. It never quits anything; you decide.
+8. **Hold new work.** `monitored gate -- COMMAND` waits (at most 30 seconds) until memory is not thrashing, then starts the command.
 
 ## Protected by default
 
