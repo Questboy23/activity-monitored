@@ -59,7 +59,7 @@ def jsave(path, obj):
     os.replace(tmp, path)
 
 def sample():
-    out = run(["ps", "-axo", "pid=,ppid=,uid=,pcpu=,rss=,stat=,command="], 8)
+    out = run(["/bin/ps", "-axo", "pid=,ppid=,uid=,pcpu=,rss=,stat=,command="], 8)
     procs = {}
     for ln in out.splitlines():
         p = ln.split(None, 6)
@@ -77,10 +77,10 @@ _last_po = [None, None]
 def memory_slow():
     if os.environ.get("MONITORED_FAKE_LEVEL"):
         return int(os.environ["MONITORED_FAKE_LEVEL"]), 0.9, float(os.environ.get("MONITORED_FAKE_PAGEOUT", "0"))
-    lvl = int(run(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"]).strip() or 1)
-    m = re.findall(r"([\d.]+)M", run(["sysctl", "-n", "vm.swapusage"]))
+    lvl = int(run(["/usr/sbin/sysctl", "-n", "kern.memorystatus_vm_pressure_level"]).strip() or 1)
+    m = re.findall(r"([\d.]+)M", run(["/usr/sbin/sysctl", "-n", "vm.swapusage"]))
     swap = float(m[1]) / float(m[0]) if len(m) >= 2 and float(m[0]) else 0.0
-    mo = re.search(r"Pageouts:\s+(\d+)", run(["vm_stat"]))
+    mo = re.search(r"Pageouts:\s+(\d+)", run(["/usr/bin/vm_stat"]))
     po, t, rate = (int(mo.group(1)) if mo else 0), now(), 0.0
     if _last_po[0] is not None and t > _last_po[1]: rate = max(0.0, (po - _last_po[0]) / (t - _last_po[1]))
     _last_po[0], _last_po[1] = po, t
@@ -107,7 +107,7 @@ def memory():
     if lvl is None or po_total is None: return memory_slow()
     t = now()
     if t - _swap_c[0] > 30:  # swap fill changes slowly: read it twice a minute
-        m = re.findall(r"([\d.]+)M", run(["sysctl", "-n", "vm.swapusage"]))
+        m = re.findall(r"([\d.]+)M", run(["/usr/sbin/sysctl", "-n", "vm.swapusage"]))
         _swap_c[0], _swap_c[1] = t, (float(m[1]) / float(m[0]) if len(m) >= 2 and float(m[0]) else 0.0)
     rate = 0.0
     if _last_po[0] is not None and t > _last_po[1]: rate = max(0.0, (po_total - _last_po[0]) / (t - _last_po[1]))
@@ -115,13 +115,13 @@ def memory():
     return lvl, _swap_c[1], rate
 
 def fg_light():
-    a = run(["lsappinfo", "front"]).strip()
-    m = re.search(r'"LSDisplayName"="([^"]*)"', run(["lsappinfo", "info", "-only", "name", a])) if a else None
+    a = run(["/usr/bin/lsappinfo", "front"]).strip()
+    m = re.search(r'"LSDisplayName"="([^"]*)"', run(["/usr/bin/lsappinfo", "info", "-only", "name", a])) if a else None
     return m.group(1) if m else None
 
 def foreground(procs):
-    a = run(["lsappinfo", "front"]).strip()
-    m = re.search(r'"pid"=(\d+)', run(["lsappinfo", "info", "-only", "pid", a])) if a else None
+    a = run(["/usr/bin/lsappinfo", "front"]).strip()
+    m = re.search(r'"pid"=(\d+)', run(["/usr/bin/lsappinfo", "info", "-only", "pid", a])) if a else None
     pid = int(m.group(1)) if m else None
     return pid, (pname(procs[pid]["cmd"]) if pid in procs else None)
 
@@ -156,7 +156,7 @@ def eligible(p):
 # ---------- executor: every action is undoable and carries its own OS-level undo timer ----------
 def dead_man(undo, ttl):
     """Starts an OS-level undo timer in its own process group and returns its id, so a refresh or undo can cancel it."""
-    return subprocess.Popen(["/bin/sh", "-c", "sleep %d; %s" % (ttl, undo)], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).pid
+    return subprocess.Popen(["/bin/sh", "-c", "sleep %d; %s" % (int(ttl), undo)], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).pid
 
 def cancel_timer(e):
     """Stops an old undo timer. Without this, a timer from an earlier refresh restores a still-demoted program early,
@@ -176,12 +176,12 @@ def apply(act, p, ttl):
             _would[(pid, act)] = now(); jl(F_EVENTS, dict(t=int(now()), ev="would_" + act, pid=pid, name=pname(p["cmd"]), cpu=p["cpu"]))
         return False
     if act == "demote":
-        if subprocess.run(["taskpolicy", "-b", "-p", str(pid)], capture_output=True).returncode != 0: return False
-        timer = dead_man("taskpolicy -B -p %d" % pid, ttl)
+        if subprocess.run(["/usr/sbin/taskpolicy", "-b", "-p", str(pid)], capture_output=True).returncode != 0: return False
+        timer = dead_man("/usr/sbin/taskpolicy -B -p %d" % int(pid), ttl)
     elif act == "pause":
         try: os.kill(pid, signal.SIGSTOP)
         except OSError: return False
-        timer = dead_man("kill -CONT %d" % pid, ttl)
+        timer = dead_man("/bin/kill -CONT %d" % int(pid), ttl)
     old = J.get(str(pid)); refresh = bool(old and old["act"] == act)
     cancel_timer(old)  # only the newest timer may end this action
     J[str(pid)] = dict(act=act, name=pname(p["cmd"]), t=now(), ttl=ttl, cpu=(old.get("cpu", p["cpu"]) if refresh else p["cpu"]), timer=timer)
@@ -193,7 +193,7 @@ def undo(pid, why):
     J = journal(); e = J.pop(str(pid), None)
     if e is None: return
     cancel_timer(e)
-    if e["act"] == "demote": subprocess.run(["taskpolicy", "-B", "-p", str(pid)], capture_output=True)
+    if e["act"] == "demote": subprocess.run(["/usr/sbin/taskpolicy", "-B", "-p", str(pid)], capture_output=True)
     else:
         try: os.kill(int(pid), signal.SIGCONT)
         except OSError: pass
@@ -227,7 +227,7 @@ def llm_json(prompt):
         with os.fdopen(fd, "w") as f: f.write(prompt)  # exactly what the last model call received, for `ctl.py privacy`
     except OSError: pass
     try:
-        out = subprocess.run(cmd + [prompt], capture_output=True, text=True, errors="replace", timeout=CFG["ai_timeout"], stdin=subprocess.DEVNULL).stdout
+        out = subprocess.run(cmd, input=prompt, capture_output=True, text=True, errors="replace", timeout=CFG["ai_timeout"]).stdout  # stdin: argv is visible to every user via ps
         m = re.search(r"\{.*\}", out, re.S)
         return json.loads(m.group(0)) if m else None
     except Exception:
@@ -235,8 +235,8 @@ def llm_json(prompt):
 
 def inspect(pid):
     """Read-only look at one process: what started it, how long it has run, where it runs. Cannot change anything."""
-    ps = run(["ps", "-o", "etime=,ppid=,command=", "-p", str(pid)]).strip()[:260]
-    cwd = [l[1:] for l in run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], 4).splitlines() if l.startswith("n")]
+    ps = run(["/bin/ps", "-o", "etime=,ppid=,command=", "-p", str(pid)]).strip()[:260]
+    cwd = [l[1:] for l in run(["/usr/sbin/lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], 4).splitlines() if l.startswith("n")]
     return dict(pid=pid, etime_ppid_command=ps, cwd=(cwd[:1] or ["?"])[0])
 
 def agent(ctx, cands, mode):
@@ -282,7 +282,7 @@ class Mon:
         self.sleep, self.batt, self.tk0, self.fg_t = CFG["tick"], (0.0, False), None, 0.0
 
     def on_battery(self):  # checked at most once a minute
-        if now() - self.batt[0] > 60: self.batt = (now(), "Battery Power" in run(["pmset", "-g", "batt"]))
+        if now() - self.batt[0] > 60: self.batt = (now(), "Battery Power" in run(["/usr/bin/pmset", "-g", "batt"]))
         return self.batt[1]
 
     def cheap(self):  # whole-machine CPU use since the last tick, from kernel counters
@@ -477,7 +477,7 @@ DEFAULTS = {"mode": "on", "ai": False, "battery_saver": True}
 def settings():
     s = dict(DEFAULTS); s.update(jload(F_SET, {})); return s
 
-def lc(*a): return subprocess.run(["launchctl"] + list(a), capture_output=True, text=True)
+def lc(*a): return subprocess.run(["/bin/launchctl"] + list(a), capture_output=True, text=True)
 def running(): return lc("list", LABEL).returncode == 0
 
 def stable_python():
@@ -491,12 +491,12 @@ def stop_agent():
 
 def write_plist(s):
     import plistlib
-    args = [stable_python(), DIR + "/monitored.py", "run", "--ai", "auto" if s["ai"] else "off"]
+    args = [stable_python(), "-I", DIR + "/monitored.py", "run", "--ai", "auto" if s["ai"] else "off"]
     if s["mode"] == "watch": args.append("--dry")
     if s["battery_saver"]: args.append("--saver")
     d = {"Label": LABEL, "ProgramArguments": args, "RunAtLoad": True, "KeepAlive": {"SuccessfulExit": False}, "ThrottleInterval": 30, "ProcessType": "Adaptive",
          "LowPriorityIO": True, "StandardOutPath": DIR + "/launchd.log", "StandardErrorPath": DIR + "/launchd.log",
-         "EnvironmentVariables": {"PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + os.path.join(HOME, ".local", "bin")}}
+         "EnvironmentVariables": {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:" + os.path.join(HOME, ".local", "bin")}}
     os.makedirs(os.path.dirname(PLIST), exist_ok=True)
     with open(PLIST, "wb") as f: plistlib.dump(d, f)
 
@@ -520,7 +520,7 @@ def cmd_install(args):
     os.makedirs(DIR, exist_ok=True); os.chmod(DIR, 0o700)
     if os.path.abspath(DIR + "/monitored.py") != SELF: shutil.copy(SELF, DIR + "/monitored.py")
     shim = DIR + "/monitored"
-    with open(shim, "w") as f: f.write('#!/bin/bash\nexec "%s" "%s/monitored.py" "$@"\n' % (stable_python(), DIR))
+    with open(shim, "w") as f: f.write('#!/bin/bash\nexec "%s" -I "%s/monitored.py" "$@"\n' % (stable_python(), DIR))
     os.chmod(shim, 0o755)
     link = os.path.join(HOME, ".local", "bin", "monitored")
     try:
