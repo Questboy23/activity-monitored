@@ -26,7 +26,7 @@ CFG = dict(tick=3.0, hog_cpu=20.0, hog_ticks=3, cpu_busy=0.75, calm_ticks=3, dem
 
 # Never touched, by command text. System daemons are excluded by path unless on the BG_OK list.
 NEVER = re.compile(r"/(WindowServer|kernel_task|launchd|loginwindow|Finder|Dock|SystemUIServer|coreaudiod|bluetoothd|sshd|tmux|Terminal|iTerm2?|Activity Monitor)(\.app|$| )|monitored\.py")
-SYSTEM_PATH = re.compile(r"^(/System/|/usr/|/sbin/|/bin/|/Library/Apple/)")
+SYSTEM_PATH = re.compile(r"^(/System/|/usr/(?!local/)|/sbin/|/bin/|/Library/Apple/)")  # /usr/local holds user-installed node, python
 BG_OK = {"photoanalysisd", "mediaanalysisd", "mdworker_shared", "mds_stores", "backupd", "suggestd", "parsecd", "siriknowledged", "cloudd"}
 # Work that matters: never demoted, and so is everything under it. Extend as needed (the AI can add names for the session).
 PRIORITY = re.compile(r"rsync|xcodebuild|swift-frontend|clang|ffmpeg|HandBrake|Final Cut|Premiere|DaVinci|Blender|Compressor|Docker|Parallels|VMware|UTM|qemu|postgres|mysqld|mongod|redis-server|nginx|gradle|\bcmake\b|\bninja\b|\bmake\b|ollama|llama-server|Spotify|zoom\.us|FaceTime|Discord|OBS|Logic Pro|GarageBand|Ableton|/Music\.app/|Microsoft Teams|/Claude\.app/|\.local/share/claude/versions|/claude( |$)|pytest|cargo|rustc|\bnpm run\b|vite|webpack|esbuild|\btsc\b")
@@ -54,7 +54,7 @@ def jload(path, default):
         with open(path) as f: return json.load(f)
     except Exception: return default
 def jsave(path, obj):
-    tmp = path + ".tmp"
+    tmp = "%s.%d.tmp" % (path, os.getpid())  # CLI and agent may save at once
     with open(tmp, "w") as f: json.dump(obj, f)
     os.replace(tmp, path)
 
@@ -161,8 +161,8 @@ def dead_man(undo, ttl):
 def cancel_timer(e):
     """Stops an old undo timer. Without this, a timer from an earlier refresh restores a still-demoted program early,
     or later runs on a reused pid."""
-    tp = (e or {}).get("timer")
-    if tp:
+    e = e or {}; tp = e.get("timer")
+    if tp and now() - e.get("t", 0) < e.get("ttl", 1e9) + 5:  # an expired timer's pid may now belong to another program
         try: os.killpg(int(tp), signal.SIGKILL)
         except (OSError, ValueError): pass
 
@@ -207,12 +207,12 @@ def apply(act, p, ttl):
             _would[(pid, act)] = now(); jl(F_EVENTS, dict(t=int(now()), ev="would_" + act, pid=pid, name=pname(p["cmd"]), cpu=p["cpu"]))
         return False
     if act == "demote":
-        if subprocess.run(["/usr/sbin/taskpolicy", "-b", "-p", str(pid)], capture_output=True).returncode != 0: return False
-        timer = dead_man("/usr/sbin/taskpolicy -B -p %d" % int(pid), ttl)
+        timer = dead_man("/usr/sbin/taskpolicy -B -p %d" % int(pid), ttl)  # undo timer first: a crash right after the action still restores it
+        if subprocess.run(["/usr/sbin/taskpolicy", "-b", "-p", str(pid)], capture_output=True).returncode != 0: cancel_timer({"timer": timer}); return False
     elif act == "pause":
-        try: os.kill(pid, signal.SIGSTOP)
-        except OSError: return False
         timer = dead_man("/bin/kill -CONT %d" % int(pid), ttl)
+        try: os.kill(pid, signal.SIGSTOP)
+        except OSError: cancel_timer({"timer": timer}); return False
     old = J.get(str(pid)); refresh = bool(old and old["act"] == act)
     cancel_timer(old)  # only the newest timer may end this action
     J[str(pid)] = dict(act=act, name=pname(p["cmd"]), t=now(), ttl=ttl, cpu=(old.get("cpu", p["cpu"]) if refresh else p["cpu"]), timer=timer)
@@ -246,7 +246,7 @@ def ai_cmd():
         if c and os.path.exists(c): return [c, "-p", "--model", "haiku"] + LEAN_FLAGS
     return None
 
-_SECRET = re.compile(r"(?i)(sk-[A-Za-z0-9_\-]{8,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{12,}|xox[abp]-[A-Za-z0-9\-]{10,}|eyJ[A-Za-z0-9_\-]{20,}|(?:key|token|secret|passw(?:or)?d|auth|bearer)[=: ]+\S+|[A-Za-z0-9+/=_\-]{40,})")
+_SECRET = re.compile(r"(?i)(sk-[A-Za-z0-9_\-]{8,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{12,}|xox[abp]-[A-Za-z0-9\-]{10,}|eyJ[A-Za-z0-9_\-]{20,}|(?:key|token|secret|passw(?:or)?d|auth|bearer)[=: ]+\S+|[A-Za-z0-9+/=_\-]{40,}|[a-z][\w+.-]*://[^/\s:@]+:[^@\s]+@|\s-p\S+)")
 def redact(t):
     """Everything sent to the model passes through here: secrets and long random-looking strings are removed, the home folder is shortened to ~."""
     return _SECRET.sub("[redacted]", t.replace(HOME, "~"))
@@ -340,14 +340,19 @@ class Mon:
         return st
 
     def ai_worker(self, ctx, cands, s):
-        raw = agent(ctx, cands, self.mode)
-        self.res = (s, valid_plan(raw, cands), cands, [str(x)[:160] for x in (raw or {}).get("advice", [])[:3]]) if raw is not None else (s, None, cands, [])
+        try:
+            raw = agent(ctx, cands, self.mode)
+            self.res = (s, valid_plan(raw, cands), cands, [str(x)[:160] for x in (raw or {}).get("advice", [])[:3]]) if raw is not None else (s, None, cands, [])
+        except Exception:  # a malformed model reply must not kill the AI thread
+            self.res = (s, None, cands, [])
 
     def tick(self):
         if os.environ.get("MONITORED_FAULT"): raise RuntimeError("fault injection (tests only)")
         use = self.cheap(); lvl, swap, po = memory(); t = now(); self.n += 1
         if not (use is None or use >= CFG["scan_at"] or journal() or lvl >= 4 or (lvl >= 2 and po >= CFG["pageout_hot"])): return self.light(use, lvl, swap, po, t)
-        procs = sample(); fg_pid, fg = foreground(procs)
+        procs = sample()
+        if not procs: return  # ps timed out: an empty table would mark every journal pid dead and drop its undo
+        fg_pid, fg = foreground(procs)
         if fg != self.last_fg: jl(F_FG, dict(t=int(t), app=fg)); self.last_fg = fg
         # Demand, not usage: a demoted process is throttled hard, so count what it was using when we demoted it (valid 120 s). Without this the monitor flaps.
         J0 = journal(); dem = {int(k): e for k, e in J0.items() if e["act"] == "demote" and int(k) in procs and t - e["t"] < 120}
@@ -469,7 +474,8 @@ def hold_now():
 
 def cmd_gate(args):
     mw = 120.0
-    if "--max-wait" in args: mw = float(args[args.index("--max-wait") + 1])
+    head = args[:args.index("--")] if "--" in args else args  # flags after -- belong to the command
+    if "--max-wait" in head: mw = float(head[head.index("--max-wait") + 1])
     cmd = args[args.index("--") + 1:] if "--" in args else []
     if not cmd: sys.exit("usage: monitored.py gate [--max-wait S] -- CMD ...")
     t0, held = now(), False
@@ -483,9 +489,17 @@ def cmd_gate(args):
     if held: sys.stderr.write("monitored gate: waited %.0f s\n" % (now() - t0))
     os.execvp(cmd[0], cmd)
 
+def _jlines(path):
+    """Parsed JSON lines; a line cut short by a full disk is skipped."""
+    out = []
+    if os.path.exists(path):
+        for x in open(path):
+            try: out.append(json.loads(x))
+            except ValueError: pass
+    return out
+
 def cmd_report(args):
-    rows = [json.loads(x) for x in open(F_LOG)] if os.path.exists(F_LOG) else []
-    ev = [json.loads(x) for x in open(F_EVENTS)] if os.path.exists(F_EVENTS) else []
+    rows, ev = _jlines(F_LOG), _jlines(F_EVENTS)
     if not rows: return print("no log yet")
     span = (rows[-1]["t"] - rows[0]["t"]) / 60.0
     hot = sum(1 for r in rows if r["cpu"] >= CFG["cpu_busy"]); hold = sum(1 for r in rows if r["hold"])
