@@ -309,6 +309,8 @@ class Mon:
     def __init__(self, mode):
         self.mode, self.streak, self.calm = mode, defaultdict(int), 0
         self.cache, self.ai_protect, self.cool = jload(F_CACHE, {}), set(), {}
+        week = now() - 7 * 86400  # AI decisions expire after a week, so a past "protect" cannot shield a later runaway forever
+        self.cache = {k: v for k, v in self.cache.items() if isinstance(v, list) and all(a.get("t", week + 1) > week for a in v)}
         self.byname = {a["name"]: a["do"] for lst in self.cache.values() for a in lst}
         self.th, self.res, self.last_ai, self.n, self.ai_calls, self.hits, self.advice = None, None, 0.0, 0, 0, 0, []
         self.last_fg, self.t_prev, self.c_prev = None, now(), sum(os.times()[:4])
@@ -377,7 +379,7 @@ class Mon:
         if self.res:  # consume a finished AI answer
             rs, plan, rc, adv = self.res; self.res = None; self.advice = adv
             if plan is not None:
-                self.cache[rs] = [dict(do=a["do"], name=pname(next(c for c in rc if c["pid"] == a["pid"])["cmd"]), why=a["why"]) for a in plan]
+                self.cache[rs] = [dict(do=a["do"], name=pname(next(c for c in rc if c["pid"] == a["pid"])["cmd"]), why=a["why"], t=int(now())) for a in plan]
                 jsave(F_CACHE, self.cache)
                 for a in self.cache[rs]: self.byname[a["name"]] = a["do"]
         names_demote, names_pause = set(), set()
