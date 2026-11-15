@@ -329,7 +329,7 @@ class Mon:
         return use
 
     def light(self, use, lvl, swap, po, t):  # nothing is contended: no process scan, no program spawned except one foreground check every 10 s
-        warn_check(lvl, swap, False)
+        warn_check(lvl, swap, False); self.streak.clear()  # hot counts from before a calm stretch must not carry over
         if t - self.fg_t >= 10:
             self.fg_t = t; fg = fg_light()
             if fg != self.last_fg: jl(F_FG, dict(t=int(t), app=fg)); self.last_fg = fg
@@ -552,7 +552,9 @@ def write_plist(s):
 
 def apply_settings():
     s = settings(); stop_agent()
-    if s["mode"] == "off": print("Activity Monitored is off. Nothing is running and nothing is slowed."); return 0
+    if s["mode"] == "off":
+        if os.path.exists(PLIST): os.remove(PLIST)  # otherwise launchd starts it again at the next login
+        print("Activity Monitored is off. Nothing is running and nothing is slowed."); return 0
     if not os.path.exists(DIR + "/monitored.py"): print("Activity Monitored is not installed. Run: python3 monitored.py install"); return 1
     write_plist(s); r = lc("bootstrap", "gui/%d" % ME, PLIST)
     if r.returncode != 0: print("macOS refused to start Activity Monitored:", r.stderr.strip()); return 1
