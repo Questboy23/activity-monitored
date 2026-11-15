@@ -355,6 +355,7 @@ class Mon:
         procs = sample()
         if not procs: return  # ps timed out: an empty table would mark every journal pid dead and drop its undo
         fg_pid, fg = foreground(procs)
+        if fg_pid is None: return  # front app unknown (lsappinfo timed out): acting now could slow the app you are using
         if fg != self.last_fg: jl(F_FG, dict(t=int(t), app=fg)); self.last_fg = fg
         # Demand, not usage: a demoted process is throttled hard, so count what it was using when we demoted it (valid 120 s). Without this the monitor flaps.
         J0 = journal(); dem = {int(k): e for k, e in J0.items() if e["act"] == "demote" and int(k) in procs and t - e["t"] < 120}
@@ -638,10 +639,48 @@ def cmd_privacy(args):
     p = os.path.join(DIR, "last_prompt.txt")
     print("Exactly what the last model call received:\n" + (open(p).read() if os.path.exists(p) else "(no model call yet)"))
 
+TERM_SCRIPT = '''tell application "Terminal"
+set out to ""
+repeat with w in windows
+repeat with t in tabs of w
+set out to out & (id of w) & (character id 9) & (busy of t as text) & (character id 9) & (tty of t) & linefeed
+end repeat
+end repeat
+return out
+end tell'''
+
+def terminal_tabs():
+    """[(window id, busy, tty)] for every Terminal tab; [] when Terminal is not running or not scriptable."""
+    if "Terminal" not in run(["/bin/ps", "-axco", "comm="]).split("\n"): return []
+    rows = []
+    for line in run(["/usr/bin/osascript", "-e", TERM_SCRIPT], 10).splitlines():
+        f = line.split("\t")
+        if len(f) == 3: rows.append((f[0], f[1] == "true", f[2]))
+    return rows
+
+def cmd_terminals(args):
+    """Lists Terminal tabs: idle (only a shell), working, or waiting (a program at under 1% CPU). --close closes idle windows."""
+    tabs = terminal_tabs()
+    if not tabs: print("No Terminal windows (or Terminal did not answer)."); return
+    cpu = defaultdict(float)
+    for ln in run(["/bin/ps", "-axo", "tty=,pcpu="]).splitlines():
+        f = ln.split()
+        if len(f) == 2:
+            try: cpu["/dev/" + f[0]] += float(f[1])
+            except ValueError: pass
+    def tty_cpu(tty): return cpu[tty]
+    idle_wins = {w for w, _, _ in tabs} - {w for w, b, _ in tabs if b}  # a window closes only when every tab in it is idle
+    for w, busy, tty in tabs:
+        state = "idle (shell only)" if not busy else ("working" if tty_cpu(tty) >= 1 else "waiting (under 1% CPU: needs input, or stuck)")
+        print("%-12s %s" % (tty, state))
+    if "--close" in args and idle_wins:
+        for w in idle_wins: run(["/usr/bin/osascript", "-e", 'tell application "Terminal" to close (every window whose id is %s)' % w], 10)
+        print("Closed %d idle window(s). Busy windows were left open." % len(idle_wins))
+
 if __name__ == "__main__":
     a = sys.argv[1:]; c = a[0] if a else ""
     table = {"run": cmd_run, "gate": cmd_gate, "report": cmd_report, "revert-all": lambda x: revert_all(), "status": cmd_status, "install": cmd_install,
              "uninstall": cmd_uninstall, "privacy": cmd_privacy, "protect": cmd_protect, "on": lambda x: set_key("mode", "on"), "watch": lambda x: set_key("mode", "watch"),
              "off": lambda x: set_key("mode", "off"), "ai": lambda x: cmd_toggle("ai", x), "battery": lambda x: cmd_toggle("battery_saver", x),
-             "version": lambda x: print(__version__), "status-json": status_json}
+             "version": lambda x: print(__version__), "terminals": cmd_terminals, "status-json": status_json}
     sys.exit(table.get(c, lambda x: print(__doc__))(a[1:]) or 0)

@@ -145,4 +145,28 @@ print(n[0])""", SM, env={"MONITORED_DIR": dm, "MONITORED_NO_NOTIFY": "1", "MONIT
 kinds = [e["kind"] for e in jl(dm + "/events.jsonl") if e.get("ev") == "warn"]
 check("memory and repeat warnings fire once each, ps sampled once", sorted(kinds) == ["memory", "repeat:hog x"] and r.stdout.strip() == "1", (kinds, r.stdout.strip(), r.stderr[-200:]))
 
+# terminals: idle windows close, a window with any busy tab stays; front app unknown means no action
+dt = tempfile.mkdtemp(); r = sh(sys.executable, "-c", """
+import importlib.util, sys
+s = importlib.util.spec_from_file_location("m", sys.argv[1]); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+calls = []
+def fake(args, t=5):
+    calls.append(args)
+    if args[0] == "/bin/ps" and "comm=" in args: return "launchd\\nTerminal\\n"
+    if args[0] == "/bin/ps": return "ttys001 0.0\\nttys003 0.4\\n"
+    if args[-1] == m.TERM_SCRIPT: return "11\\tfalse\\t/dev/ttys001\\n22\\tfalse\\t/dev/ttys002\\n22\\ttrue\\t/dev/ttys003\\n"
+    return ""
+m.run = fake; m.cmd_terminals(["--close"])
+closed = [a[-1] for a in calls if "close" in a[-1]]
+print("CLOSED", closed)
+m.foreground = lambda procs: (None, None); m.sample = lambda: {1: dict(pid=1, ppid=0, uid=0, cpu=99.0, rss=0, stat="R", cmd="x")}
+m.memory = lambda: (4, 0.9, 999)
+mon = m.Mon("on"); mon.cheap = lambda: 1.0
+acted = []; m.act = lambda *a, **k: acted.append(a)
+print("RET", mon.tick(), "ACTED", len(acted))
+""", SM, env={"MONITORED_DIR": dt, "MONITORED_NO_NOTIFY": "1", "MONITORED_DISK_MIN_GB": "0"})
+out = r.stdout
+check("terminals closes only the all-idle window", "id is 11" in out and "id is 22" not in out and "waiting" in out, (out[-400:], r.stderr[-300:]))
+check("unknown front app: tick takes no action", "RET None ACTED 0" in out, (out[-200:], r.stderr[-300:]))
+
 print("\n%d of %d passed" % (sum(results), len(results)))
