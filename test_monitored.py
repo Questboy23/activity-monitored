@@ -44,13 +44,13 @@ for run_no in (1, 2):
     hs = hogs(24)
     if run_no == 2:  # replay check must not depend on what else is busy on this machine: every process name in the table already has a stored decision
         os.environ["MONITORED_DIR"] = d6; sys.path.insert(0, HERE); import monitored
-        dec = json.load(open(d6 + "/decisions.json")); dec["seed"] = [dict(do="demote", name=n, why="seed") for n in {monitored.pname(p["cmd"]) for p in monitored.sample().values()} if n]
+        dec = json.load(open(d6 + "/decisions.json")) if os.path.exists(d6 + "/decisions.json") else {}; dec["seed"] = [dict(do="demote", name=n, why="seed") for n in {monitored.pname(p["cmd"]) for p in monitored.sample().values()} if n]
         json.dump(dec, open(d6 + "/decisions.json", "w"))
     sh(sys.executable, SM, "run", "--ai", "stub", "--ticks", "12", "--tick", "1", "--hog_ticks", "2", "--hog_cpu", "3", "--ai_every", "30" if run_no == 1 else "1e12", env={"MONITORED_DIR": d6})
     st = json.load(open(d6 + "/status.json")); ev = jl(d6 + "/events.jsonl"); killall(hs); out.append(st)
     time.sleep(1)
 left = json.load(open(d6 + "/journal.json")) if os.path.exists(d6 + "/journal.json") else {}
-check("agent run 1: one model call, decision cached, advice produced", out[0]["ai_calls"] == 1 and bool(json.load(open(d6 + "/decisions.json"))) and bool(out[0]["advice"]), "ai_calls %s advice %s" % (out[0]["ai_calls"], out[0]["advice"]))
+check("agent run 1: one model call, decision cached, advice produced", out[0]["ai_calls"] == 1 and os.path.exists(d6 + "/decisions.json") and bool(json.load(open(d6 + "/decisions.json"))) and bool(out[0]["advice"]), "ai_calls %s advice %s" % (out[0]["ai_calls"], out[0]["advice"]))
 check("agent run 2 (new calls forbidden): replays the cached decision, 0 model calls", out[1]["ai_calls"] == 0 and out[1]["cache_hits"] > 0, "ai_calls %s cache_hits %s" % (out[1]["ai_calls"], out[1]["cache_hits"]))
 E6 = jl(d6 + "/events.jsonl")
 check("everything undone at exit (journal empty)", left == {}, "demotes %d undos %d (a demoted process that died needs no undo)" % (sum(e["ev"] == "demote" for e in E6), sum(e["ev"] == "undo_demote" for e in E6)))
@@ -93,7 +93,9 @@ check("busy programs with ordinary names are slowed, and the same load named ffm
 d12 = tempfile.mkdtemp(); hogs(12)
 pids12 = set(subprocess.run(["pgrep", "-f", MARK], capture_output=True, text=True).stdout.split())
 p12 = subprocess.Popen([sys.executable, SM, "run", "--ai", "off", "--tick", "1", "--hog_ticks", "2", "--hog_cpu", "3"], env=dict(os.environ, MONITORED_DIR=d12))
-time.sleep(9); before = sum(str(e.get("pid")) in pids12 for e in jl(d12 + "/events.jsonl") if e["ev"] == "demote")
+before, t12 = 0, time.time()
+while not before and time.time() - t12 < 40:  # a busy Mac can take longer than 9 s to reach the first slowdown
+    time.sleep(1); before = sum(str(e.get("pid")) in pids12 for e in (jl(d12 + "/events.jsonl") if os.path.exists(d12 + "/events.jsonl") else []) if e["ev"] == "demote")
 open(d12 + "/protect.txt", "w").write(MARK + "\n"); time.sleep(5)
 ev12 = jl(d12 + "/events.jsonl"); left = json.load(open(d12 + "/journal.json")) if os.path.exists(d12 + "/journal.json") else {}
 p12.terminate(); p12.wait(); killall()
@@ -129,7 +131,7 @@ sh(sys.executable, SM, "run", "--ticks", "3", "--tick", "0.5", "--ai", "off", en
 w = [e for e in jl(dw + "/events.jsonl") if e.get("ev") == "warn"]
 check("low disk produces exactly one rate-limited warning", len(w) == 1 and w[0]["kind"] == "disk" and "GB free" in w[0]["msg"], w)
 r = sh(sys.executable, SM, "status", env=env)
-check("status reports disk free and the warning", "Disk free:" in r.stdout and "Warning: Disk nearly full" in r.stdout, r.stdout[-200:])
+check("status reports disk free and the warning", "Disk free:" in r.stdout and "ago): Disk nearly full" in r.stdout, r.stdout[-200:])
 dw2 = tempfile.mkdtemp(); sh(sys.executable, SM, "run", "--ticks", "3", "--tick", "0.5", "--ai", "off", env={"MONITORED_DIR": dw2, "MONITORED_DISK_MIN_GB": "0", "MONITORED_NO_NOTIFY": "1"}, t=60)
 check("enough disk produces no disk warning", not [e for e in jl(dw2 + "/events.jsonl") if e.get("kind") == "disk"])
 
@@ -139,11 +141,22 @@ import importlib.util, sys
 s = importlib.util.spec_from_file_location("m", sys.argv[1]); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
 n = [0]; real = m.sample
 def counted(): n[0] += 1; return real()
-m.sample = counted; m._demotes.extend([(m.now(), "hog x")] * 10)
+m.sample = counted; m.emergency = lambda *a: None; m._demotes.extend([(m.now(), "hog x")] * 10)  # emergency kills real tabs; tested dry below
 for _ in range(30): m.warn_check(2, 0.95, False)
 print(n[0])""", SM, env={"MONITORED_DIR": dm, "MONITORED_NO_NOTIFY": "1", "MONITORED_DISK_MIN_GB": "0"})
 kinds = [e["kind"] for e in jl(dm + "/events.jsonl") if e.get("ev") == "warn"]
 check("memory and repeat warnings fire once each, ps sampled once", sorted(kinds) == ["memory", "repeat:hog x"] and r.stdout.strip() == "1", (kinds, r.stdout.strip(), r.stderr[-200:]))
+
+# emergency: after 20 exhausted ticks it picks the >3 GB browser renderer (dry run, fake processes, nothing is killed)
+de = tempfile.mkdtemp(); r = sh(sys.executable, "-c", """
+import importlib.util, sys
+s = importlib.util.spec_from_file_location("m", sys.argv[1]); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+m.DRY = True
+m.sample = lambda: {11: dict(uid=m.ME, cmd="/Applications/Google Chrome.app/x/Google Chrome Helper (Renderer) --type=renderer", rss=0), 12: dict(uid=m.ME, cmd="/usr/bin/python3 big.py", rss=0)}
+m.footprints = lambda *a: [(12, 9.0), (11, 4.0)]
+for _ in range(25): m.emergency(m.now(), 2, 0.95)""", SM, env={"MONITORED_DIR": de, "MONITORED_NO_NOTIFY": "1"})
+ek = [e for e in jl(de + "/events.jsonl") if e.get("ev", "").startswith("emergency-kill")]
+check("emergency picks only the browser renderer, once, dry", len(ek) == 1 and ek[0]["pid"] == 11 and ek[0]["ev"] == "emergency-kill-dry", (ek, r.stderr[-300:]))
 
 # terminals: idle windows close, a window with any busy tab stays; front app unknown means no action
 dt = tempfile.mkdtemp(); r = sh(sys.executable, "-c", """
@@ -170,3 +183,4 @@ check("terminals closes only the all-idle window", "id is 11" in out and "id is 
 check("unknown front app: tick takes no action", "RET None ACTED 0" in out, (out[-200:], r.stderr[-300:]))
 
 print("\n%d of %d passed" % (sum(results), len(results)))
+sys.exit(0 if all(results) else 1)

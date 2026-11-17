@@ -26,7 +26,7 @@ What remains are background programs you did not ask for: helper processes stuck
 
 ## What it never does
 
-It never kills a program, edits a file, sends anything over the network (with AI off), asks for an admin password, or touches another user's programs.
+It kills a program in one case only: when memory has been exhausted for 20 checks in a row, it force-quits the one browser tab or web renderer using more than 3 GB (the tab reloads), at most once every 10 minutes. It deletes files in one case only: when the disk has under 8 GB free and the file ~/.monitored/auto-clean exists, it empties download caches (Homebrew, pip, npm, uv, pnpm). It never edits other files, sends anything over the network (with AI off), asks for an admin password, or touches another user's programs.
 
 ## Why it is different from current options
 

@@ -26,7 +26,7 @@ Faster, if you trust the author: this one line runs the script without you readi
 curl -fsSL https://raw.githubusercontent.com/Questboy23/activity-monitored/main/install.sh | bash
 ```
 
-No Terminal? Click the green **Code** button, choose **Download ZIP**, unzip it, then right-click `Install Activity Monitored.command` and choose **Open**.
+No Terminal? Click **Download for Mac** on https://reedostrov.com/activity-monitored/, double-click the zip, then double-click `Install Activity Monitored.command`. The first time, macOS blocks it because it is not from the App Store: open System Settings, Privacy & Security, scroll down, click **Open Anyway**, then double-click it again.
 
 It needs macOS and the Python that comes with Apple's Command Line Tools. If a window offers to install them, click Install, wait, then run the line again.
 
@@ -56,6 +56,7 @@ macOS shows a "Background Items Added" notice for `python3` the first time. That
 ## Safety
 
 - It lowers priority only (`taskpolicy -b`), and on Apple silicon that also moves the program to the efficiency cores. A pause action exists in the code and is switched off.
+- Two emergency actions go beyond that. When memory has been exhausted for 20 checks in a row, it force-quits the one browser tab or web renderer using over 3 GB (the tab reloads), at most once every 10 minutes. When the disk has under 8 GB free and `~/.monitored/auto-clean` exists, it empties download caches (Homebrew, pip, npm, uv, pnpm).
 - Every slowdown has its own macOS timer (90 s). If Activity Monitored crashes or is removed, programs speed up again by themselves. Test: killing Activity Monitored mid-pause resumed the program 8 s later (one trial).
 - It never touches the app you are using and its helpers, system programs (WindowServer, Finder, Dock), Terminal, or media, call and developer tools (Spotify, Zoom, FaceTime, Discord, OBS, Logic Pro, GarageBand, Ableton, Music, Teams, Claude, ollama, pytest, cargo, npm run).
 - Work you started on purpose is protected too: builds and tests, renders (ffmpeg, HandBrake, Final Cut, Premiere, DaVinci, Blender), virtual machines, containers, and local databases and servers. The full list is in `HOW_IT_WORKS.md`.
@@ -73,7 +74,8 @@ macOS shows a "Background Items Added" notice for `python3` the first time. That
 | `monitored battery on\|off` | battery saver: checks less often and makes no model calls on battery |
 | `monitored ai on\|off` | optional Claude judgment (default off) |
 | `monitored protect NAME` | never touch programs whose command contains NAME |
-| `monitored gate -- CMD` | start CMD once memory is not thrashing (waits at most 30 s) |
+| `monitored terminals` | list Terminal tabs as idle, working or waiting (`--close` closes windows whose tabs are all idle) |
+| `monitored gate -- CMD` | start CMD once memory is not thrashing (waits at most 120 s; change with `--max-wait S`) |
 | `monitored report` | log summary |
 | `monitored uninstall` | remove everything (`--purge` also deletes logs) |
 
@@ -87,7 +89,7 @@ macOS shows a "Background Items Added" notice for `python3` the first time. That
 ## Limitations
 
 - macOS only. Tested on one MacBook Air (Apple silicon, macOS 26.7). Intel Macs and older macOS are untested.
-- Early release (0.1.0). The only benchmark is synthetic, has 3 runs per arm and ran on one Mac. No speedup on real work is measured.
+- Early release (0.2.2). The only benchmark is synthetic, has 3 runs per arm and ran on one Mac. No speedup on real work is measured.
 - Not compared against App Tamer, Process Lasso-style tools or plain macOS.
 - `test_monitored.py` needs macOS (`launchctl`). It was not rerun in the 2026-11 audit because the audit machine ran Linux.
 - Activity Monitored cannot free memory. It can only delay starting new jobs.

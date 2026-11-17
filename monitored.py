@@ -8,6 +8,7 @@ While the CPU is oversubscribed, Activity Monitored lowers the priority of busy 
   monitored battery on|off    battery saver: checks less often and makes no model calls while on battery
   monitored protect NAME      never touch programs whose command contains NAME
   monitored gate [--max-wait S] -- CMD   start CMD once memory is not thrashing (waits at most S seconds)
+  monitored terminals [--close]  list Terminal tabs as idle, working or waiting; --close closes all-idle windows
   monitored report | privacy | uninstall [--purge] | version
 """
 import ctypes, json, os, re, shutil, signal, subprocess, sys, threading, time
@@ -29,7 +30,7 @@ NEVER = re.compile(r"/(WindowServer|kernel_task|launchd|loginwindow|Finder|Dock|
 SYSTEM_PATH = re.compile(r"^(/System/|/usr/(?!local/)|/sbin/|/bin/|/Library/Apple/)")  # /usr/local holds user-installed node, python
 BG_OK = {"photoanalysisd", "mediaanalysisd", "mdworker_shared", "mds_stores", "backupd", "suggestd", "parsecd", "siriknowledged", "cloudd"}
 # Work that matters: never demoted, and so is everything under it. Extend as needed (the AI can add names for the session).
-PRIORITY = re.compile(r"rsync|xcodebuild|swift-frontend|clang|ffmpeg|HandBrake|Final Cut|Premiere|DaVinci|Blender|Compressor|Docker|Parallels|VMware|UTM|qemu|postgres|mysqld|mongod|redis-server|nginx|gradle|\bcmake\b|\bninja\b|\bmake\b|ollama|llama-server|Spotify|zoom\.us|FaceTime|Discord|OBS|Logic Pro|GarageBand|Ableton|/Music\.app/|Microsoft Teams|/Claude\.app/|\.local/share/claude/versions|/claude( |$)|pytest|cargo|rustc|\bnpm run\b|vite|webpack|esbuild|\btsc\b")
+PRIORITY = re.compile(r"rsync|xcodebuild|swift-frontend|clang|ffmpeg|HandBrake|Final Cut|Premiere|DaVinci|Blender|Compressor|Docker|Parallels|VMware|UTM|qemu|postgres|mysqld|mongod|redis-server|nginx|gradle|\bcmake\b|\bninja\b|\bmake\b|ollama|llama-server|Spotify|zoom\.us|FaceTime|Discord|OBS|Logic Pro|GarageBand|Ableton|/Music\.app/|Microsoft Teams|/Claude\.app/|\.local/share/claude/versions|(^|/)claude( |$)|pytest|cargo|rustc|\bnpm run\b|vite|webpack|esbuild|\btsc\b")
 
 def _user_protect():
     """Programs the user asked Activity Monitored never to touch: one name per line in protect.txt (a command containing the name is protected)."""
@@ -555,7 +556,7 @@ def cmd_report(args):
     print("own CPU use, average %% of one core while logging: %.2f" % (sum(r["own"] for r in rows) / len(rows)))
 
 # ---------- install, settings, friendly commands ----------
-__version__ = "0.1.0"
+__version__ = "0.2.2"
 LABEL = os.environ.get("MONITORED_LABEL", "com.activitymonitored.agent")
 PLIST = os.path.join(HOME, "Library", "LaunchAgents", LABEL + ".plist")
 F_SET = DIR + "/settings.json"
@@ -582,7 +583,7 @@ def write_plist(s):
     args = [stable_python(), "-I", DIR + "/monitored.py", "run", "--ai", "auto" if s["ai"] else "off"]
     if s["mode"] == "watch": args.append("--dry")
     if s["battery_saver"]: args.append("--saver")
-    d = {"Label": LABEL, "ProgramArguments": args, "RunAtLoad": True, "KeepAlive": {"SuccessfulExit": False}, "ThrottleInterval": 30, "ProcessType": "Adaptive",
+    d = {"Label": LABEL, "ProgramArguments": args, "RunAtLoad": True, "KeepAlive": {"SuccessfulExit": False}, "ThrottleInterval": 30, "ProcessType": "Interactive",
          "LowPriorityIO": True, "StandardOutPath": DIR + "/launchd.log", "StandardErrorPath": DIR + "/launchd.log",
          "EnvironmentVariables": {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:" + os.path.join(HOME, ".local", "bin")}}
     os.makedirs(os.path.dirname(PLIST), exist_ok=True)
@@ -668,7 +669,9 @@ def cmd_status(args):
     for a in st.get("advice", [])[:3]: print("Suggestion (never done automatically): " + a)
     gb = disk_free_gb()
     if gb is not None: print("Disk free: %.0f GB%s." % (gb, " (too low: below %d GB apps can freeze)" % WARN["disk_min_gb"] if gb < WARN["disk_min_gb"] else ""))
-    for e in [e for e in ev if e.get("ev") == "warn"][-3:]: print("Warning: " + e.get("msg", ""))
+    for e in [e for e in ev if e.get("ev") == "warn"][-3:]:
+        m = int((now() - e.get("t", 0)) // 60)
+        print("Warning (%s ago): %s" % ("%d h" % (m // 60) if m >= 60 else "%d min" % m, e.get("msg", "")))
 
 def cmd_privacy(args):
     ai = settings()["ai"]
@@ -720,4 +723,7 @@ if __name__ == "__main__":
              "uninstall": cmd_uninstall, "privacy": cmd_privacy, "protect": cmd_protect, "on": lambda x: set_key("mode", "on"), "watch": lambda x: set_key("mode", "watch"),
              "off": lambda x: set_key("mode", "off"), "ai": lambda x: cmd_toggle("ai", x), "battery": lambda x: cmd_toggle("battery_saver", x),
              "version": lambda x: print(__version__), "terminals": cmd_terminals, "status-json": status_json}
-    sys.exit(table.get(c, lambda x: print(__doc__))(a[1:]) or 0)
+    if c not in table:
+        print(__doc__)
+        sys.exit(0 if c in ("", "help", "-h", "--help") else "monitored: unknown command: %s" % c)
+    sys.exit(table[c](a[1:]) or 0)
