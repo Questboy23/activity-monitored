@@ -184,6 +184,42 @@ def notify(key, msg):  # at most one warning per kind every 30 minutes
         try: subprocess.Popen(["/usr/bin/osascript", "-e", "on run a", "-e", 'display notification (item 1 of a) with title "Activity Monitored"', "-e", "end run", msg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError: pass
     return True
+# Emergency: the one place this tool acts beyond slowing. Memory exhausted for ~60 s -> kill the biggest browser/Electron
+# renderer (its window or tab reloads; the app stays open). Disk under 8 GB -> delete regenerable download caches.
+EMERG = dict(ticks=20, renderer_gb=3.0, every=600, disk_gb=8.0)
+RENDERER = re.compile(r"Helper \(Renderer\)|Helper \(GPU\)|Web Content|WebKit\.WebContent")
+CACHES = ["Library/Caches/Homebrew/downloads", "Library/Caches/pip", ".npm/_cacache", ".cache/uv", "Library/Caches/pnpm", ".cache/pip"]
+_estate = dict(mem=0, kill_t=0.0, disk_t=0.0)
+def footprints(n=15):  # real memory per process (includes compressed and swapped pages), which RSS leaves out
+    out, res = run(["/usr/bin/top", "-l", "1", "-o", "mem", "-stats", "pid,mem", "-n", str(n)], 20), []
+    for l in out.splitlines():
+        m = re.match(r"\s*(\d+)\s+([\d.]+)([KMGB])\+?-?\s*$", l)
+        if m: res.append((int(m.group(1)), float(m.group(2)) * {"B": 1e-9, "K": 1e-6, "M": 1e-3, "G": 1.0}[m.group(3)]))
+    return res
+def emergency(t, lvl, swap):
+    _estate["mem"] = _estate["mem"] + 1 if (lvl is not None and (lvl >= 4 or (lvl >= 2 and swap >= WARN["swap_full"]))) else 0
+    if _estate["mem"] >= EMERG["ticks"] and t - _estate["kill_t"] >= EMERG["every"]:
+        _estate["mem"], procs = 0, sample()
+        for pid, gb in footprints():
+            p = procs.get(pid)
+            if not p or p["uid"] != ME or gb < EMERG["renderer_gb"] or not RENDERER.search(p["cmd"]): continue
+            _estate["kill_t"] = t
+            if DRY: jl(F_EVENTS, dict(t=int(t), ev="emergency-kill-dry", pid=pid, name=pname(p["cmd"]), gb=round(gb, 1))); break
+            try: os.kill(pid, signal.SIGKILL)
+            except OSError: continue
+            jl(F_EVENTS, dict(t=int(t), ev="emergency-kill", pid=pid, name=pname(p["cmd"]), gb=round(gb, 1), swap=round(swap, 2)))
+            _warned.pop("emergency", None); notify("emergency", "Memory exhausted: killed %s (%.1f GB) to prevent a freeze. Its window or tab reloads." % (pname(p["cmd"]), gb))
+            break
+    if t - _estate["disk_t"] >= EMERG["every"]:
+        gb = disk_free_gb()
+        if gb is not None and gb < EMERG["disk_gb"]:
+            _estate["disk_t"] = t
+            for c in CACHES:
+                d = os.path.join(HOME, c)
+                if os.path.isdir(d) and not DRY and os.path.exists(os.path.join(DIR, "auto-clean")): shutil.rmtree(d, ignore_errors=True)
+            after = disk_free_gb() or gb
+            jl(F_EVENTS, dict(t=int(t), ev="emergency-disk", before=round(gb, 1), after=round(after, 1)))
+            _warned.pop("disk-clean", None); notify("disk-clean", "Disk at %.1f GB free: cleared download caches, now %.1f GB. Swap needs free disk; delete big files." % (gb, after))
 def warn_check(lvl, swap, mem_hot):
     t = now()
     if t - _wstate["disk_t"] >= 60:
@@ -194,6 +230,7 @@ def warn_check(lvl, swap, mem_hot):
     if _wstate["mem"] >= WARN["mem_ticks"] and t - _warned.get("memory", 0) >= WARN["every"]:  # check the limit first: ps is costly while memory is short
         top = sorted(sample().values(), key=lambda p: -p["rss"])[:3]
         if notify("memory", "Memory exhausted (swap %d%% full). Biggest: %s. Quit one to avoid a freeze." % (round(100 * swap), ", ".join("%s %.1f GB" % (pname(p["cmd"]), p["rss"] / 1e9) for p in top))): _wstate["mem"] = 0
+    emergency(t, lvl, swap)
     del _demotes[:max(0, len(_demotes) - 500)]
     recent = defaultdict(int)
     for tt, n in _demotes:
