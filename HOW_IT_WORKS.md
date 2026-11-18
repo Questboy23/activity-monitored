@@ -11,9 +11,8 @@ A Mac has a fixed amount of processor time. When more programs ask for it than e
 3. **Pick culprits.** A program becomes a culprit when all of these hold: it is yours, it is not protected, it used more than 20% of one core for three checks in a row (about 9 seconds), and the whole Mac is at least 75% busy.
 4. **Slow it down.** It marks the culprit as a background program. macOS then gives it lower priority, runs it on the low-power cores of an Apple silicon Mac, and slows its disk and network use. Nothing is killed, paused, or changed in the program.
 5. **Undo it.** After the Mac has been calm for three checks (and the slowdown is at least 30 seconds old), the program is restored. A second timer, set at the moment of the slowdown, restores it after 90 seconds no matter what, even if Activity Monitored crashes or is removed. If you switch to a slowed program, it is restored within one check. While the overload continues, the slowdown is renewed each minute.
-6. **Optional AI judgment (off by default).** For a situation it has not seen, it can send the names and usage of the busiest programs to a Claude model through your own `claude` login. The model answers slow, leave alone, or a suggestion for you. Answers are stored by program name and reused with no further calls. The code accepts only program numbers from the list and only the reversible actions.
-7. **Warn about what slowing cannot fix.** It shows a macOS notification, at most once per 30 minutes for each kind, when free disk space drops below 20 GB (macOS needs it for swap, and a full disk freezes apps), when memory stays exhausted (swap over 90% full) for about 10 checks, naming the 3 biggest programs, or when one program is slowed 10 or more times in an hour. It never quits anything; you decide.
-8. **Hold new work.** `monitored gate -- COMMAND` waits (at most 30 seconds) until memory is not thrashing, then starts the command.
+6. **Warn about what slowing cannot fix.** It shows a macOS notification, at most once per 30 minutes for each kind, when free disk space drops below 20 GB (macOS needs it for swap, and a full disk freezes apps), when memory stays exhausted (swap over 90% full) for about 10 checks, naming the 3 biggest programs. It never quits anything; you decide.
+7. **Hold new work.** `monitored gate -- COMMAND` waits (at most 120 seconds; change with `--max-wait S`) until memory is not thrashing, then starts the command.
 
 ## Protected by default
 
@@ -26,14 +25,14 @@ What remains are background programs you did not ask for: helper processes stuck
 
 ## What it never does
 
-It kills a program in one case only: when memory has been exhausted for 20 checks in a row, it force-quits the one browser tab or web renderer using more than 3 GB (the tab reloads), at most once every 10 minutes. It deletes files in one case only: when the disk has under 8 GB free and the file ~/.monitored/auto-clean exists, it empties download caches (Homebrew, pip, npm, uv, pnpm). It never edits other files, sends anything over the network (with AI off), asks for an admin password, or touches another user's programs.
+It never quits, pauses or kills a program, deletes or edits your files, sends anything over the network, asks for an admin password, or touches another user's programs.
 
 ## Why it is different from current options
 
 - **macOS alone** shares time by internal rules and has no setting for "slow the programs I do not care about while I work".
 - **App Tamer** (paid) gives a program background priority whenever it is not the front app, according to its developer. The trigger is where you are looking. Activity Monitored's trigger is real overload, so an idle or lightly used Mac is never touched.
 - **Process Lasso** (Windows only) lowers the priority of processes that hog the processor. Activity Monitored applies the same idea on macOS.
-- **Activity Monitored adds:** protection for work you started on purpose, an automatic undo that survives a crash, optional AI judgment with stored answers, and a free open script.
+- **Activity Monitored adds:** protection for work you started on purpose, an automatic undo that survives a crash, and a free open script.
 - **Not measured:** a head-to-head comparison with App Tamer. The only benchmark so far is synthetic: a job finished in 24.2 s instead of 39.3 s while 24 background processes competed (median of 3 runs each).
 
 ## Definitions
@@ -48,4 +47,3 @@ It kills a program in one case only: when memory has been exhausted for 20 check
 - **LaunchAgent (login item):** a macOS mechanism that starts a program at login and restarts it after a crash. Activity Monitored installs one without admin rights.
 - **Dead-man timer:** a separate short script started with every slowdown that undoes it after 90 seconds. It runs even if the monitor is gone.
 - **Foreground app:** the app in front, found with macOS's `lsappinfo`.
-- **Decision cache:** stored answers keyed by program name, so a program the AI already judged costs no further model calls.

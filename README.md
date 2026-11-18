@@ -30,11 +30,9 @@ No Terminal? Click **Download for Mac** on https://reedostrov.com/activity-monit
 
 It needs macOS and the Python that comes with Apple's Command Line Tools. If a window offers to install them, click Install, wait, then run the line again.
 
-## Do I need Claude Code or an account?
+## Do I need an account?
 
 No. Activity Monitored works with nothing else installed: no account, no API key, no network.
-
-Optional: `monitored ai on` lets a Claude model judge unfamiliar situations. That runs the `claude` program already on your Mac with your own login, so it uses your usage and never the author's. It is off by default. `monitored privacy` shows exactly what would be sent.
 
 ## Measured results
 
@@ -55,9 +53,8 @@ macOS shows a "Background Items Added" notice for `python3` the first time. That
 
 ## Safety
 
-- It lowers priority only (`taskpolicy -b`), and on Apple silicon that also moves the program to the efficiency cores. A pause action exists in the code and is switched off.
-- Two emergency actions go beyond that. When memory has been exhausted for 20 checks in a row, it force-quits the one browser tab or web renderer using over 3 GB (the tab reloads), at most once every 10 minutes. When the disk has under 8 GB free and `~/.monitored/auto-clean` exists, it empties download caches (Homebrew, pip, npm, uv, pnpm).
-- Every slowdown has its own macOS timer (90 s). If Activity Monitored crashes or is removed, programs speed up again by themselves. Test: killing Activity Monitored mid-pause resumed the program 8 s later (one trial).
+- It lowers priority only (`taskpolicy -b`), and on Apple silicon that also moves the program to the efficiency cores. It never quits, pauses or deletes anything.
+- Every slowdown has its own macOS timer (90 s). If Activity Monitored crashes or is removed, programs speed up again by themselves. Test: killing Activity Monitored right after a slowdown restored the program 6 s later.
 - It never touches the app you are using and its helpers, system programs (WindowServer, Finder, Dock), Terminal, or media, call and developer tools (Spotify, Zoom, FaceTime, Discord, OBS, Logic Pro, GarageBand, Ableton, Music, Teams, Claude, ollama, pytest, cargo, npm run).
 - Work you started on purpose is protected too: builds and tests, renders (ffmpeg, HandBrake, Final Cut, Premiere, DaVinci, Blender), virtual machines, containers, and local databases and servers. The full list is in `HOW_IT_WORKS.md`.
 - Add your own: `monitored protect NAME`.
@@ -72,11 +69,8 @@ macOS shows a "Background Items Added" notice for `python3` the first time. That
 | `monitored on` | act (default after install) |
 | `monitored off` | stop and undo everything |
 | `monitored battery on\|off` | battery saver: checks less often and makes no model calls on battery |
-| `monitored ai on\|off` | optional Claude judgment (default off) |
 | `monitored protect NAME` | never touch programs whose command contains NAME |
-| `monitored terminals` | list Terminal tabs as idle, working or waiting (`--close` closes windows whose tabs are all idle) |
 | `monitored gate -- CMD` | start CMD once memory is not thrashing (waits at most 120 s; change with `--max-wait S`) |
-| `monitored report` | log summary |
 | `monitored uninstall` | remove everything (`--purge` also deletes logs) |
 
 ## How it works
@@ -84,20 +78,19 @@ macOS shows a "Background Items Added" notice for `python3` the first time. That
 1. Every 6 to 10 s when calm (3 s when busy), it reads CPU use and memory pressure straight from the kernel. A calm check costs about 0.2% of one core.
 2. When CPU use reaches about 72%, it lists your programs. One that stays above 20% CPU for 3 checks while the Mac is 75% busy, and is not protected, gets background priority.
 3. It restores the program after the Mac has been calm for 3 checks (at least 30 s), or when the 90 s timer ends.
-4. Optional: a Claude model decides unfamiliar cases. Decisions are stored by program name and reused with no further calls.
 
 ## Limitations
 
 - macOS only. Tested on one MacBook Air (Apple silicon, macOS 26.7). Intel Macs and older macOS are untested.
-- Early release (0.2.2). The only benchmark is synthetic, has 3 runs per arm and ran on one Mac. No speedup on real work is measured.
+- Early release (0.3.0). The only benchmark is synthetic, has 3 runs per arm and ran on one Mac. No speedup on real work is measured.
 - Not compared against App Tamer, Process Lasso-style tools or plain macOS.
-- `test_monitored.py` needs macOS (`launchctl`). It was not rerun in the 2026-11 audit because the audit machine ran Linux.
+- `test_monitored.py` needs macOS. 23 of 23 pass on the author's Mac.
 - Activity Monitored cannot free memory. It can only delay starting new jobs.
 - A background program that the front app depends on (a local server, for example) can slow the front app when it is slowed. Add it with `monitored protect NAME`.
 - If macOS cannot report which app is in front (rare), only the protected list guards you.
 - Each slowdown is undone by a timer that names a process number. If that number is reused by another program within 90 s, the timer runs `taskpolicy -B` on it, which only removes background priority.
 - The installer downloads `monitored.py` from the `main` branch. Read it first if you do not trust that branch.
-- Defaults after install: mode `on` (acts), AI judgment off, battery saver on. `monitored watch` logs without acting.
+- Defaults after install: mode `on` (acts), battery saver on. `monitored watch` logs without acting.
 
 ## More detail
 

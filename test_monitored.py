@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for monitored v2. Run: python3 test_monitored.py [--real-ai]. Each test uses its own temp state dir and cleans up its processes."""
+"""Tests for monitored. Run: python3 test_monitored.py. Each test uses its own temp state dir and cleans up its processes."""
 import json, os, subprocess, sys, tempfile, time
 HERE = os.path.dirname(os.path.abspath(__file__)); SM = os.path.join(HERE, "monitored.py")
 results = []
@@ -26,32 +26,27 @@ w = subprocess.Popen([sys.executable, "-c", "import json,time,os\nd=os.environ['
 time.sleep(1); t = time.time(); r = sh(sys.executable, SM, "gate", "--max-wait", "30", "--", "echo", "ran", env={"MONITORED_DIR": d3}); dt = time.time() - t; w.kill()
 check("gate releases as soon as the monitor clears the hold", 1.5 <= dt <= 8 and "ran" in r.stdout, "%.1f s" % dt)
 
-# 4 crash safety: pause, then the program dies instantly; the OS-level timer must resume the process
-d4 = tempfile.mkdtemp(); h = subprocess.Popen([sys.executable, "-c", "while True: pass"])
-sh(sys.executable, "-c", "import sys,os; sys.path.insert(0,%r); import monitored; monitored.apply('pause', dict(pid=%d,cmd='hog',cpu=99), 6); os._exit(1)" % (HERE, h.pid), env={"MONITORED_DIR": d4})
-s1 = stat(h.pid); time.sleep(8); s2 = stat(h.pid); h.kill(); h.wait()
-check("paused process resumes by itself after the monitor crashes", "T" in s1 and "T" not in s2, "just after crash %s, 8 s later %s" % (s1, s2))
+# 4 crash safety: slow a program, then the monitor dies instantly; the OS-level timer must restore its priority
+d4 = tempfile.mkdtemp(); h = subprocess.Popen([sys.executable, "-c", "while True: pass"]); time.sleep(0.5)
+def pri(pid): return sh("ps", "-o", "pri=", "-p", str(pid)).stdout.strip()
+p0 = pri(h.pid)
+sh(sys.executable, "-c", "import sys,os; sys.path.insert(0,%r); import monitored; monitored.apply('demote', dict(pid=%d,cmd='hog',cpu=99), 6); os._exit(1)" % (HERE, h.pid), env={"MONITORED_DIR": d4})
+s1 = pri(h.pid); time.sleep(8); s2 = pri(h.pid); h.kill(); h.wait()
+check("slowed program is restored by itself after the monitor crashes", s1 == "4" and s2 == p0, "before %s, just after crash %s, 8 s later %s" % (p0, s1, s2))
 
 # 5 dry run changes nothing
 d5 = tempfile.mkdtemp(); hs = hogs(24)
-sh(sys.executable, SM, "run", "--ai", "off", "--dry", "--ticks", "9", "--tick", "1", "--hog_ticks", "2", "--hog_cpu", "3", env={"MONITORED_DIR": d5})
+sh(sys.executable, SM, "run", "--dry", "--ticks", "9", "--tick", "1", "--hog_ticks", "2", "--hog_cpu", "3", env={"MONITORED_DIR": d5})
 ev = jl(d5 + "/events.jsonl"); killall(hs)
 check("dry run logs would_demote and changes nothing", any(e["ev"] == "would_demote" for e in ev) and not any(e["ev"] == "demote" for e in ev), "events %s" % sorted({e["ev"] for e in ev}))
 
-# 6 agent loop (stub model): investigates, acts, writes advice, caches the decision; a second run replays it with 0 model calls
-d6 = tempfile.mkdtemp(); out = []
+# 6 two real runs: busy programs are slowed, everything is undone at exit, no flapping
+d6 = tempfile.mkdtemp()
 for run_no in (1, 2):
     hs = hogs(24)
-    if run_no == 2:  # replay check must not depend on what else is busy on this machine: every process name in the table already has a stored decision
-        os.environ["MONITORED_DIR"] = d6; sys.path.insert(0, HERE); import monitored
-        dec = json.load(open(d6 + "/decisions.json")) if os.path.exists(d6 + "/decisions.json") else {}; dec["seed"] = [dict(do="demote", name=n, why="seed") for n in {monitored.pname(p["cmd"]) for p in monitored.sample().values()} if n]
-        json.dump(dec, open(d6 + "/decisions.json", "w"))
-    sh(sys.executable, SM, "run", "--ai", "stub", "--ticks", "12", "--tick", "1", "--hog_ticks", "2", "--hog_cpu", "3", "--ai_every", "30" if run_no == 1 else "1e12", env={"MONITORED_DIR": d6})
-    st = json.load(open(d6 + "/status.json")); ev = jl(d6 + "/events.jsonl"); killall(hs); out.append(st)
-    time.sleep(1)
+    sh(sys.executable, SM, "run", "--ticks", "12", "--tick", "1", "--hog_ticks", "2", "--hog_cpu", "3", env={"MONITORED_DIR": d6})
+    killall(hs); time.sleep(1)
 left = json.load(open(d6 + "/journal.json")) if os.path.exists(d6 + "/journal.json") else {}
-check("agent run 1: one model call, decision cached, advice produced", out[0]["ai_calls"] == 1 and os.path.exists(d6 + "/decisions.json") and bool(json.load(open(d6 + "/decisions.json"))) and bool(out[0]["advice"]), "ai_calls %s advice %s" % (out[0]["ai_calls"], out[0]["advice"]))
-check("agent run 2 (new calls forbidden): replays the cached decision, 0 model calls", out[1]["ai_calls"] == 0 and out[1]["cache_hits"] > 0, "ai_calls %s cache_hits %s" % (out[1]["ai_calls"], out[1]["cache_hits"]))
 E6 = jl(d6 + "/events.jsonl")
 check("everything undone at exit (journal empty)", left == {}, "demotes %d undos %d (a demoted process that died needs no undo)" % (sum(e["ev"] == "demote" for e in E6), sum(e["ev"] == "undo_demote" for e in E6)))
 check("no flapping: at most 2 demotes per busy process over 2 runs of 12 s", sum(e["ev"] == "demote" for e in E6) <= 2 * 2 * 24 + 8, "%d demotes" % sum(e["ev"] == "demote" for e in E6))
@@ -60,19 +55,10 @@ check("no flapping: at most 2 demotes per busy process over 2 runs of 12 s", sum
 bad = [e for e in jl(d6 + "/events.jsonl") if e.get("name") in ("WindowServer", "kernel_task", "launchd", "Finder", "Dock", "Claude", "Claude Helper")]
 check("protected names never acted on", not bad, bad[:2])
 
-# 8 optional: real model
-if "--real-ai" in sys.argv:
-    d8 = tempfile.mkdtemp(); hs = hogs(24); t = time.time()
-    sh(sys.executable, SM, "run", "--ai", "auto", "--ticks", "45", "--tick", "2", "--hog_ticks", "2", "--hog_cpu", "3", "--ai_every", "0", env={"MONITORED_DIR": d8}, t=170)
-    st = json.load(open(d8 + "/status.json")); killall(hs)
-    dec = json.load(open(d8 + "/decisions.json")) if os.path.exists(d8 + "/decisions.json") else {}
-    print("REAL MODEL: ai_calls %s, decisions %s, advice %s, wall %.0f s" % (st["ai_calls"], json.dumps(dec)[:600], st["advice"], time.time() - t))
-    check("real model returned a valid plan", bool(dec))
-
 # 9 a failing tick is logged and the monitor keeps going; 10 in a row exit non-zero so the login item restarts it
-d9 = tempfile.mkdtemp(); r = sh(sys.executable, SM, "run", "--ai", "off", "--ticks", "3", "--tick", "1", env={"MONITORED_DIR": d9, "MONITORED_FAULT": "1"})
+d9 = tempfile.mkdtemp(); r = sh(sys.executable, SM, "run", "--ticks", "3", "--tick", "1", env={"MONITORED_DIR": d9, "MONITORED_FAULT": "1"})
 check("a failing tick is logged and the monitor keeps running", r.returncode == 0 and sum(e["ev"] == "error" for e in jl(d9 + "/events.jsonl")) == 3, r.stderr[-100:])
-d9b = tempfile.mkdtemp(); r = sh(sys.executable, SM, "run", "--ai", "off", "--ticks", "20", "--tick", "1", env={"MONITORED_DIR": d9b, "MONITORED_FAULT": "1"})
+d9b = tempfile.mkdtemp(); r = sh(sys.executable, SM, "run", "--ticks", "20", "--tick", "1", env={"MONITORED_DIR": d9b, "MONITORED_FAULT": "1"})
 check("10 failing ticks in a row exit with code 1", r.returncode == 1 and sum(e["ev"] == "error" for e in jl(d9b + "/events.jsonl")) == 10, "code %s" % r.returncode)
 # 10 log rotation
 d10 = tempfile.mkdtemp(); big = d10 + "/x.jsonl"; open(big, "w").write("x" * 4100000)
@@ -85,14 +71,14 @@ for tag in ("plain_hog", "ffmpeg"):
 time.sleep(0.5)
 def pids_of(tag): return set(subprocess.run(["pgrep", "-f", tag + " " + MARK], capture_output=True, text=True).stdout.split())
 plain, ff = pids_of("plain_hog"), pids_of("ffmpeg")
-sh(sys.executable, SM, "run", "--ai", "off", "--ticks", "14", "--tick", "1", "--hog_ticks", "2", "--hog_cpu", "3", env={"MONITORED_DIR": d11})
+sh(sys.executable, SM, "run", "--ticks", "14", "--tick", "1", "--hog_ticks", "2", "--hog_cpu", "3", env={"MONITORED_DIR": d11})
 ev11 = jl(d11 + "/events.jsonl"); killall()
 dp = sum(1 for e in ev11 if e["ev"] == "demote" and str(e.get("pid")) in plain); df = sum(1 for e in ev11 if e["ev"] == "demote" and str(e.get("pid")) in ff)
 check("busy programs with ordinary names are slowed, and the same load named ffmpeg is not", len(plain) >= 6 and len(ff) >= 6 and dp > 0 and df == 0, "ordinary %d slowed of %d, ffmpeg %d slowed of %d" % (dp, len(plain), df, len(ff)))
 # 12 a slowed program that becomes protected is restored within seconds (stands in for switching to it)
 d12 = tempfile.mkdtemp(); hogs(12)
 pids12 = set(subprocess.run(["pgrep", "-f", MARK], capture_output=True, text=True).stdout.split())
-p12 = subprocess.Popen([sys.executable, SM, "run", "--ai", "off", "--tick", "1", "--hog_ticks", "2", "--hog_cpu", "3"], env=dict(os.environ, MONITORED_DIR=d12))
+p12 = subprocess.Popen([sys.executable, SM, "run", "--tick", "1", "--hog_ticks", "2", "--hog_cpu", "3"], env=dict(os.environ, MONITORED_DIR=d12))
 before, t12 = 0, time.time()
 while not before and time.time() - t12 < 40:  # a busy Mac can take longer than 9 s to reach the first slowdown
     time.sleep(1); before = sum(str(e.get("pid")) in pids12 for e in (jl(d12 + "/events.jsonl") if os.path.exists(d12 + "/events.jsonl") else []) if e["ev"] == "demote")
@@ -127,60 +113,42 @@ _m.undo(_t.pid, "test"); time.sleep(0.3); _t.kill()
 check("a refreshed demotion keeps one undo timer and undo cancels it", _one and not _alive(_second), "first %s second %s" % (_first, _second))
 # warnings: a disk under the threshold produces one disk warning (rate-limited), and status shows disk free and the warning
 dw = tempfile.mkdtemp(); env = {"MONITORED_DIR": dw, "MONITORED_DISK_MIN_GB": "1000000", "MONITORED_NO_NOTIFY": "1"}
-sh(sys.executable, SM, "run", "--ticks", "3", "--tick", "0.5", "--ai", "off", env=env, t=60)
+sh(sys.executable, SM, "run", "--ticks", "3", "--tick", "0.5", env=env, t=60)
 w = [e for e in jl(dw + "/events.jsonl") if e.get("ev") == "warn"]
 check("low disk produces exactly one rate-limited warning", len(w) == 1 and w[0]["kind"] == "disk" and "GB free" in w[0]["msg"], w)
 r = sh(sys.executable, SM, "status", env=env)
 check("status reports disk free and the warning", "Disk free:" in r.stdout and "ago): Disk nearly full" in r.stdout, r.stdout[-200:])
-dw2 = tempfile.mkdtemp(); sh(sys.executable, SM, "run", "--ticks", "3", "--tick", "0.5", "--ai", "off", env={"MONITORED_DIR": dw2, "MONITORED_DISK_MIN_GB": "0", "MONITORED_NO_NOTIFY": "1"}, t=60)
+dw2 = tempfile.mkdtemp(); sh(sys.executable, SM, "run", "--ticks", "3", "--tick", "0.5", env={"MONITORED_DIR": dw2, "MONITORED_DISK_MIN_GB": "0", "MONITORED_NO_NOTIFY": "1"}, t=60)
 check("enough disk produces no disk warning", not [e for e in jl(dw2 + "/events.jsonl") if e.get("kind") == "disk"])
 
-# memory and repeat-hog warnings fire once each and stay rate-limited; ps runs once, not every tick
+# memory warning fires once and stays rate-limited; ps runs once, not every tick; a program slowed 30 times makes no popup
 dm = tempfile.mkdtemp(); r = sh(sys.executable, "-c", """
 import importlib.util, sys
 s = importlib.util.spec_from_file_location("m", sys.argv[1]); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
 n = [0]; real = m.sample
 def counted(): n[0] += 1; return real()
-m.sample = counted; m.emergency = lambda *a: None; m._demotes.extend([(m.now(), "hog x")] * 10)  # emergency kills real tabs; tested dry below
+m.sample = counted
 for _ in range(30): m.warn_check(2, 0.95, False)
 print(n[0])""", SM, env={"MONITORED_DIR": dm, "MONITORED_NO_NOTIFY": "1", "MONITORED_DISK_MIN_GB": "0"})
 kinds = [e["kind"] for e in jl(dm + "/events.jsonl") if e.get("ev") == "warn"]
-check("memory and repeat warnings fire once each, ps sampled once", sorted(kinds) == ["memory", "repeat:hog x"] and r.stdout.strip() == "1", (kinds, r.stdout.strip(), r.stderr[-200:]))
+check("memory warning fires once, ps sampled once, nothing else pops up", kinds == ["memory"] and r.stdout.strip() == "1", (kinds, r.stdout.strip(), r.stderr[-200:]))
 
-# emergency: after 20 exhausted ticks it picks the >3 GB browser renderer (dry run, fake processes, nothing is killed)
-de = tempfile.mkdtemp(); r = sh(sys.executable, "-c", """
-import importlib.util, sys
-s = importlib.util.spec_from_file_location("m", sys.argv[1]); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
-m.DRY = True
-m.sample = lambda: {11: dict(uid=m.ME, cmd="/Applications/Google Chrome.app/x/Google Chrome Helper (Renderer) --type=renderer", rss=0), 12: dict(uid=m.ME, cmd="/usr/bin/python3 big.py", rss=0)}
-m.footprints = lambda *a: [(12, 9.0), (11, 4.0)]
-for _ in range(25): m.emergency(m.now(), 2, 0.95)""", SM, env={"MONITORED_DIR": de, "MONITORED_NO_NOTIFY": "1"})
-ek = [e for e in jl(de + "/events.jsonl") if e.get("ev", "").startswith("emergency-kill")]
-check("emergency picks only the browser renderer, once, dry", len(ek) == 1 and ek[0]["pid"] == 11 and ek[0]["ev"] == "emergency-kill-dry", (ek, r.stderr[-300:]))
-
-# terminals: idle windows close, a window with any busy tab stays; front app unknown means no action
+# front app unknown means no action
 dt = tempfile.mkdtemp(); r = sh(sys.executable, "-c", """
 import importlib.util, sys
 s = importlib.util.spec_from_file_location("m", sys.argv[1]); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
-calls = []
-def fake(args, t=5):
-    calls.append(args)
-    if args[0] == "/bin/ps" and "comm=" in args: return "launchd\\nTerminal\\n"
-    if args[0] == "/bin/ps": return "ttys001 0.0\\nttys003 0.4\\n"
-    if args[-1] == m.TERM_SCRIPT: return "11\\tfalse\\t/dev/ttys001\\n22\\tfalse\\t/dev/ttys002\\n22\\ttrue\\t/dev/ttys003\\n"
-    return ""
-m.run = fake; m.cmd_terminals(["--close"])
-closed = [a[-1] for a in calls if "close" in a[-1]]
-print("CLOSED", closed)
-m.foreground = lambda procs: (None, None); m.sample = lambda: {1: dict(pid=1, ppid=0, uid=0, cpu=99.0, rss=0, stat="R", cmd="x")}
+m.foreground = lambda procs: (None, None); m.sample = lambda: {1: dict(pid=1, ppid=0, uid=m.ME, cpu=99.0, rss=0, stat="R", cmd="x")}
 m.memory = lambda: (4, 0.9, 999)
-mon = m.Mon("on"); mon.cheap = lambda: 1.0
-acted = []; m.act = lambda *a, **k: acted.append(a)
+mon = m.Mon(); mon.cheap = lambda: 1.0
+acted = []; m.apply = lambda *a, **k: acted.append(a)
 print("RET", mon.tick(), "ACTED", len(acted))
 """, SM, env={"MONITORED_DIR": dt, "MONITORED_NO_NOTIFY": "1", "MONITORED_DISK_MIN_GB": "0"})
 out = r.stdout
-check("terminals closes only the all-idle window", "id is 11" in out and "id is 22" not in out and "waiting" in out, (out[-400:], r.stderr[-300:]))
 check("unknown front app: tick takes no action", "RET None ACTED 0" in out, (out[-200:], r.stderr[-300:]))
+
+# gate with a missing program: a clear message and exit 1, not a Python traceback
+r = sh(sys.executable, SM, "gate", "--", "no-such-program-xyz", env={"MONITORED_DIR": tempfile.mkdtemp()})
+check("gate with a missing program prints one line and exits 1", r.returncode == 1 and "cannot run no-such-program-xyz" in r.stderr and "Traceback" not in r.stderr, r.stderr[-200:])
 
 print("\n%d of %d passed" % (sum(results), len(results)))
 sys.exit(0 if all(results) else 1)

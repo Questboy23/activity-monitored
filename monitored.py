@@ -4,14 +4,12 @@ While the CPU is oversubscribed, Activity Monitored lowers the priority of busy 
   monitored install           install and start (one command; see README)
   monitored status            what Activity Monitored is doing right now and in the last 24 hours
   monitored on | watch | off  on: act. watch: log what it would do, change nothing. off: stop and undo everything
-  monitored ai on|off         let a Claude model judge unfamiliar situations (default off; uses your own claude login)
-  monitored battery on|off    battery saver: checks less often and makes no model calls while on battery
+  monitored battery on|off    battery saver: checks less often while on battery
   monitored protect NAME      never touch programs whose command contains NAME
   monitored gate [--max-wait S] -- CMD   start CMD once memory is not thrashing (waits at most S seconds)
-  monitored terminals [--close]  list Terminal tabs as idle, working or waiting; --close closes all-idle windows
-  monitored report | privacy | uninstall [--purge] | version
+  monitored uninstall [--purge] | version
 """
-import ctypes, json, os, re, shutil, signal, subprocess, sys, threading, time
+import ctypes, json, os, re, shutil, signal, subprocess, sys, time
 from collections import defaultdict
 
 HOME = os.path.expanduser("~")
@@ -19,17 +17,17 @@ DIR = os.environ.get("MONITORED_DIR", os.path.join(HOME, ".monitored"))
 os.makedirs(DIR, exist_ok=True)
 try: os.chmod(DIR, 0o700)
 except OSError: pass
-F_STATUS, F_JOURNAL, F_CACHE = DIR + "/status.json", DIR + "/journal.json", DIR + "/decisions.json"
+F_STATUS, F_JOURNAL = DIR + "/status.json", DIR + "/journal.json"
 F_LOG, F_EVENTS, F_FG = DIR + "/log.jsonl", DIR + "/events.jsonl", DIR + "/foreground.jsonl"
 NCPU, ME = os.cpu_count() or 8, os.getuid()
-CFG = dict(tick=3.0, hog_cpu=20.0, hog_ticks=3, cpu_busy=0.75, calm_ticks=3, demote_ttl=90, pause_ttl=20,
-           pause_cooldown=120, max_demote=40, max_pause=0, pageout_hot=60.0, ai_every=120, ai_timeout=40, adaptive=True, scan_at=0.72, saver=False)
+CFG = dict(tick=3.0, hog_cpu=20.0, hog_ticks=3, cpu_busy=0.75, calm_ticks=3, demote_ttl=90,
+           max_demote=40, pageout_hot=60.0, adaptive=True, scan_at=0.72, saver=False)
 
 # Never touched, by command text. System daemons are excluded by path unless on the BG_OK list.
 NEVER = re.compile(r"/(WindowServer|kernel_task|launchd|loginwindow|Finder|Dock|SystemUIServer|coreaudiod|bluetoothd|sshd|tmux|Terminal|iTerm2?|Activity Monitor)(\.app|$| )|monitored\.py")
 SYSTEM_PATH = re.compile(r"^(/System/|/usr/(?!local/)|/sbin/|/bin/|/Library/Apple/)")  # /usr/local holds user-installed node, python
 BG_OK = {"photoanalysisd", "mediaanalysisd", "mdworker_shared", "mds_stores", "backupd", "suggestd", "parsecd", "siriknowledged", "cloudd"}
-# Work that matters: never demoted, and so is everything under it. Extend as needed (the AI can add names for the session).
+# Work that matters: never demoted, and so is everything under it. Add your own with `monitored protect NAME`.
 PRIORITY = re.compile(r"rsync|xcodebuild|swift-frontend|clang|ffmpeg|HandBrake|Final Cut|Premiere|DaVinci|Blender|Compressor|Docker|Parallels|VMware|UTM|qemu|postgres|mysqld|mongod|redis-server|nginx|gradle|\bcmake\b|\bninja\b|\bmake\b|ollama|llama-server|Spotify|zoom\.us|FaceTime|Discord|OBS|Logic Pro|GarageBand|Ableton|/Music\.app/|Microsoft Teams|/Claude\.app/|\.local/share/claude/versions|(^|/)claude( |$)|pytest|cargo|rustc|\bnpm run\b|vite|webpack|esbuild|\btsc\b")
 
 def _user_protect():
@@ -134,7 +132,7 @@ def tree(kids, root):
         s.add(x); st.extend(kids.get(x, []))
     return s
 
-def classify(procs, fg_pid, ai_protect):
+def classify(procs, fg_pid):
     kids = defaultdict(list)
     for p in procs.values(): kids[p["ppid"]].append(p["pid"])
     protected, priority = set(), set()
@@ -145,7 +143,6 @@ def classify(procs, fg_pid, ai_protect):
     for p in procs.values():
         if NEVER.search(p["cmd"]): protected.add(p["pid"])
         if (PRIORITY.search(p["cmd"]) or (up and up.search(p["cmd"]))) and p["pid"] != os.getpid(): priority |= tree(kids, p["pid"])
-        if pname(p["cmd"]) in ai_protect: priority |= tree(kids, p["pid"])
     return protected | priority, priority
 
 def eligible(p):
@@ -171,9 +168,9 @@ def journal(): return jload(F_JOURNAL, {})
 
 DRY, _would = False, {}
 
-# Warnings: things slowing a process cannot fix (full disk, memory exhausted, a program that keeps coming back). It tells you; it still never kills.
-WARN = dict(disk_min_gb=float(os.environ.get("MONITORED_DISK_MIN_GB", "20")), swap_full=0.9, mem_ticks=10, repeat_n=10, every=1800)
-_demotes, _warned, _wstate = [], {}, dict(disk_t=0.0, mem=0)
+# Warnings: things slowing a process cannot fix (full disk, memory exhausted). It tells you; it never kills or deletes.
+WARN = dict(disk_min_gb=float(os.environ.get("MONITORED_DISK_MIN_GB", "20")), swap_full=0.9, mem_ticks=10, every=1800)
+_warned, _wstate = {}, dict(disk_t=0.0, mem=0)
 def disk_free_gb():
     try: v = os.statvfs(HOME); return v.f_bavail * v.f_frsize / 1e9
     except OSError: return None
@@ -185,42 +182,6 @@ def notify(key, msg):  # at most one warning per kind every 30 minutes
         try: subprocess.Popen(["/usr/bin/osascript", "-e", "on run a", "-e", 'display notification (item 1 of a) with title "Activity Monitored"', "-e", "end run", msg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError: pass
     return True
-# Emergency: the one place this tool acts beyond slowing. Memory exhausted for ~60 s -> kill the biggest browser/Electron
-# renderer (its window or tab reloads; the app stays open). Disk under 8 GB -> delete regenerable download caches.
-EMERG = dict(ticks=20, renderer_gb=3.0, every=600, disk_gb=8.0)
-RENDERER = re.compile(r"Helper \(Renderer\)|Helper \(GPU\)|Web Content|WebKit\.WebContent")
-CACHES = ["Library/Caches/Homebrew/downloads", "Library/Caches/pip", ".npm/_cacache", ".cache/uv", "Library/Caches/pnpm", ".cache/pip"]
-_estate = dict(mem=0, kill_t=0.0, disk_t=0.0)
-def footprints(n=15):  # real memory per process (includes compressed and swapped pages), which RSS leaves out
-    out, res = run(["/usr/bin/top", "-l", "1", "-o", "mem", "-stats", "pid,mem", "-n", str(n)], 20), []
-    for l in out.splitlines():
-        m = re.match(r"\s*(\d+)\s+([\d.]+)([KMGB])\+?-?\s*$", l)
-        if m: res.append((int(m.group(1)), float(m.group(2)) * {"B": 1e-9, "K": 1e-6, "M": 1e-3, "G": 1.0}[m.group(3)]))
-    return res
-def emergency(t, lvl, swap):
-    _estate["mem"] = _estate["mem"] + 1 if (lvl is not None and (lvl >= 4 or (lvl >= 2 and swap >= WARN["swap_full"]))) else 0
-    if _estate["mem"] >= EMERG["ticks"] and t - _estate["kill_t"] >= EMERG["every"]:
-        _estate["mem"], procs = 0, sample()
-        for pid, gb in footprints():
-            p = procs.get(pid)
-            if not p or p["uid"] != ME or gb < EMERG["renderer_gb"] or not RENDERER.search(p["cmd"]): continue
-            _estate["kill_t"] = t
-            if DRY: jl(F_EVENTS, dict(t=int(t), ev="emergency-kill-dry", pid=pid, name=pname(p["cmd"]), gb=round(gb, 1))); break
-            try: os.kill(pid, signal.SIGKILL)
-            except OSError: continue
-            jl(F_EVENTS, dict(t=int(t), ev="emergency-kill", pid=pid, name=pname(p["cmd"]), gb=round(gb, 1), swap=round(swap, 2)))
-            _warned.pop("emergency", None); notify("emergency", "Memory exhausted: killed %s (%.1f GB) to prevent a freeze. Its window or tab reloads." % (pname(p["cmd"]), gb))
-            break
-    if t - _estate["disk_t"] >= EMERG["every"]:
-        gb = disk_free_gb()
-        if gb is not None and gb < EMERG["disk_gb"]:
-            _estate["disk_t"] = t
-            for c in CACHES:
-                d = os.path.join(HOME, c)
-                if os.path.isdir(d) and not DRY and os.path.exists(os.path.join(DIR, "auto-clean")): shutil.rmtree(d, ignore_errors=True)
-            after = disk_free_gb() or gb
-            jl(F_EVENTS, dict(t=int(t), ev="emergency-disk", before=round(gb, 1), after=round(after, 1)))
-            _warned.pop("disk-clean", None); notify("disk-clean", "Disk at %.1f GB free: cleared download caches, now %.1f GB. Swap needs free disk; delete big files." % (gb, after))
 def warn_check(lvl, swap, mem_hot):
     t = now()
     if t - _wstate["disk_t"] >= 60:
@@ -231,126 +192,36 @@ def warn_check(lvl, swap, mem_hot):
     if _wstate["mem"] >= WARN["mem_ticks"] and t - _warned.get("memory", 0) >= WARN["every"]:  # check the limit first: ps is costly while memory is short
         top = sorted(sample().values(), key=lambda p: -p["rss"])[:3]
         if notify("memory", "Memory exhausted (swap %d%% full). Biggest: %s. Quit one to avoid a freeze." % (round(100 * swap), ", ".join("%s %.1f GB" % (pname(p["cmd"]), p["rss"] / 1e9) for p in top))): _wstate["mem"] = 0
-    emergency(t, lvl, swap)
-    del _demotes[:max(0, len(_demotes) - 500)]
-    recent = defaultdict(int)
-    for tt, n in _demotes:
-        if t - tt < 3600: recent[n] += 1
-    for n, c in recent.items():
-        if c >= WARN["repeat_n"]: notify("repeat:" + n, "%s keeps hogging the CPU (slowed %d times this hour). Slowing does not fix it; quit or fix it." % (n, c))
 def apply(act, p, ttl):
     pid, J = p["pid"], journal()
     if DRY:  # log what would happen, change nothing
         if now() - _would.get((pid, act), 0) > 60:
             _would[(pid, act)] = now(); jl(F_EVENTS, dict(t=int(now()), ev="would_" + act, pid=pid, name=pname(p["cmd"]), cpu=p["cpu"]))
         return False
-    if act == "demote":
-        timer = dead_man("/usr/sbin/taskpolicy -B -p %d" % int(pid), ttl)  # undo timer first: a crash right after the action still restores it
-        if subprocess.run(["/usr/sbin/taskpolicy", "-b", "-p", str(pid)], capture_output=True).returncode != 0: cancel_timer({"timer": timer}); return False
-    elif act == "pause":
-        timer = dead_man("/bin/kill -CONT %d" % int(pid), ttl)
-        try: os.kill(pid, signal.SIGSTOP)
-        except OSError: cancel_timer({"timer": timer}); return False
+    timer = dead_man("/usr/sbin/taskpolicy -B -p %d" % int(pid), ttl)  # undo timer first: a crash right after the action still restores it
+    if subprocess.run(["/usr/sbin/taskpolicy", "-b", "-p", str(pid)], capture_output=True).returncode != 0: cancel_timer({"timer": timer}); return False
     old = J.get(str(pid)); refresh = bool(old and old["act"] == act)
     cancel_timer(old)  # only the newest timer may end this action
     J[str(pid)] = dict(act=act, name=pname(p["cmd"]), t=now(), ttl=ttl, cpu=(old.get("cpu", p["cpu"]) if refresh else p["cpu"]), timer=timer)
     jsave(F_JOURNAL, J)
     if not refresh:
         jl(F_EVENTS, dict(t=int(now()), ev=act, pid=pid, name=pname(p["cmd"]), cpu=p["cpu"]))
-        if act == "demote": _demotes.append((now(), pname(p["cmd"])))
     return True
 
 def undo(pid, why):
     J = journal(); e = J.pop(str(pid), None)
     if e is None: return
     cancel_timer(e)
-    if e["act"] == "demote": subprocess.run(["/usr/sbin/taskpolicy", "-B", "-p", str(pid)], capture_output=True)
-    else:
-        try: os.kill(int(pid), signal.SIGCONT)
-        except OSError: pass
+    subprocess.run(["/usr/sbin/taskpolicy", "-B", "-p", str(pid)], capture_output=True)
     jsave(F_JOURNAL, J)
     jl(F_EVENTS, dict(t=int(now()), ev="undo_" + e["act"], pid=int(pid), name=e["name"], why=why))
 
 def revert_all(why="revert-all"):
     for pid in list(journal()): undo(pid, why)
 
-# ---------- AI layer: decision cache first, one small model call only on a new situation ----------
-# Without these flags one headless call loaded every plugin and hook: measured 15.7 s and 46 CPU-seconds. With them: 2 to 4 s and 3 to 6 CPU-seconds.
-LEAN_FLAGS = ["--setting-sources", "", "--strict-mcp-config", "--exclude-dynamic-system-prompt-sections", "--tools", "", "--max-turns", "1", "--disable-slash-commands", "--no-session-persistence"]
-
-def ai_cmd():
-    if os.environ.get("MONITORED_AI_CMD"): return os.environ["MONITORED_AI_CMD"].split()
-    for c in (os.path.join(HOME, ".local/bin/claude"), shutil.which("claude")):
-        if c and os.path.exists(c): return [c, "-p", "--model", "haiku"] + LEAN_FLAGS
-    return None
-
-_SECRET = re.compile(r"(?i)(sk-[A-Za-z0-9_\-]{8,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{12,}|xox[abp]-[A-Za-z0-9\-]{10,}|eyJ[A-Za-z0-9_\-]{20,}|(?:key|token|secret|passw(?:or)?d|auth|bearer)[=: ]+\S+|[A-Za-z0-9+/=_\-]{40,}|[a-z][\w+.-]*://[^/\s:@]+:[^@\s]+@|\s-p\S+)")
-def redact(t):
-    """Everything sent to the model passes through here: secrets and long random-looking strings are removed, the home folder is shortened to ~."""
-    return _SECRET.sub("[redacted]", t.replace(HOME, "~"))
-
-def llm_json(prompt):
-    cmd = ai_cmd()
-    if not cmd: return None
-    prompt = redact(prompt)
-    try:
-        fd = os.open(DIR + "/last_prompt.txt", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f: f.write(prompt)  # exactly what the last model call received, for `ctl.py privacy`
-    except OSError: pass
-    try:
-        out = subprocess.run(cmd, input=prompt, capture_output=True, text=True, errors="replace", timeout=CFG["ai_timeout"]).stdout  # stdin: argv is visible to every user via ps
-        m = re.search(r"\{.*\}", out, re.S)
-        return json.loads(m.group(0)) if m else None
-    except Exception:
-        return None
-
-def inspect(pid):
-    """Read-only look at one process: what started it, how long it has run, where it runs. Cannot change anything."""
-    ps = run(["/bin/ps", "-o", "etime=,ppid=,command=", "-p", str(pid)]).strip()[:260]
-    cwd = [l[1:] for l in run(["/usr/sbin/lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], 4).splitlines() if l.startswith("n")]
-    return dict(pid=pid, etime_ppid_command=ps, cwd=(cwd[:1] or ["?"])[0])
-
-def agent(ctx, cands, mode):
-    """Up to 3 rounds: the model may ask to inspect up to 4 processes per round, then must return actions + advice.
-    Actions are validated by code (pids from the list only, 3 reversible verbs only). Advice is text for the human and is never executed."""
-    ids, seen = {c["pid"] for c in cands}, []
-    lines = "\n".join("%d,%s,%.0f,%d" % (c["pid"], pname(c["cmd"]), c["cpu"], c["rss"] // 2**20) for c in cands)
-    for rnd in range(3):
-        if mode == "stub":
-            raw = {"inspect": [c["pid"] for c in cands[:2]]} if rnd == 0 else {"actions": [dict(do="demote", pid=c["pid"], why="stub") for c in cands[:5]], "advice": ["stub: consider quitting the biggest idle app"]}
-        else:
-            prompt = ("You are a careful agent managing CPU and memory on one user's Mac. You may only take REVERSIBLE actions. Reply with JSON only, no prose.\n"
-                      'To learn more first, reply {"inspect":[pid,...]} (max 4 pids, read-only). ' if rnd < 2 else "You must now give the final answer. ") + (
-                      'Final reply: {"actions":[{"do":"demote|pause|protect","pid":N,"why":"short"}],"advice":["irreversible things the human could do, e.g. quit X; these are never executed"]}. '
-                      "demote = lower to background priority (default). pause = freeze up to 20 s (only non-interactive batch work over 80% CPU). protect = leave alone (anything that looks like the user's own work). At most 5 actions; pids only from the list.\n"
-                      + json.dumps(ctx) + "\nCANDIDATES (pid,name,cpu%,rssMB):\n" + lines + ("\nINSPECTED:\n" + json.dumps(seen) if seen else ""))
-            raw = llm_json(prompt)
-        if raw is None: return None
-        if "inspect" in raw and rnd < 2:
-            seen += [inspect(x) for x in raw["inspect"][:4] if isinstance(x, int) and x in ids]
-            continue
-        return raw
-    return None
-
-def valid_plan(raw, cands):
-    ok, pids = [], {c["pid"] for c in cands}
-    for a in (raw or {}).get("actions", [])[:5]:
-        if a.get("do") in ("demote", "pause", "protect") and isinstance(a.get("pid"), int) and a["pid"] in pids:
-            ok.append(dict(do=a["do"], pid=a["pid"], why=str(a.get("why", ""))[:80]))
-    return ok
-
-def sig(fg, cands, cpu_hot, mem_hot):
-    return "|".join([fg or "-", "c" if cpu_hot else "-", "m" if mem_hot else "-"] + sorted({pname(c["cmd"]) for c in cands[:3]}))
-
-# ---------- monitor loop ----------
 class Mon:
-    def __init__(self, mode):
-        self.mode, self.streak, self.calm = mode, defaultdict(int), 0
-        self.cache, self.ai_protect, self.cool = jload(F_CACHE, {}), set(), {}
-        week = now() - 7 * 86400  # AI decisions expire after a week, so a past "protect" cannot shield a later runaway forever
-        self.cache = {k: v for k, v in self.cache.items() if isinstance(v, list) and all(a.get("t", week + 1) > week for a in v)}
-        self.byname = {a["name"]: a["do"] for lst in self.cache.values() for a in lst}
-        self.th, self.res, self.last_ai, self.n, self.ai_calls, self.hits, self.advice = None, None, 0.0, 0, 0, 0, []
+    def __init__(self):
+        self.streak, self.calm, self.n = defaultdict(int), 0, 0
         self.last_fg, self.t_prev, self.c_prev = None, now(), sum(os.times()[:4])
         self.sleep, self.batt, self.tk0, self.fg_t = CFG["tick"], (0.0, False), None, 0.0
 
@@ -374,17 +245,10 @@ class Mon:
         self.sleep = ((10.0 if self.on_battery() else 6.0) if CFG["adaptive"] else CFG["tick"])
         ct = sum(os.times()[:4]); ovh = 100.0 * (ct - self.c_prev) / max(1e-6, t - self.t_prev); self.c_prev, self.t_prev = ct, t
         st = dict(ts=t, level=lvl, swap=round(swap, 3), pageout_rate=round(po, 1), cpu_frac=round(use or 0.0, 3), cpu_hot=False, mem_hot=False, hold=False, dry=DRY, fg=self.last_fg,
-                  demoted=[], paused=[], ai_calls=self.ai_calls, cache_hits=self.hits, advice=self.advice, own_cpu_pct=round(ovh, 2), mode="light")
+                  demoted=[], own_cpu_pct=round(ovh, 2), mode="light")
         jsave(F_STATUS, st)
-        if self.n % 5 == 0: jl(F_LOG, dict(t=int(t), lv=lvl, sw=round(swap, 2), po=round(po), cpu=round(use or 0.0, 2), hold=False, nd=0, np=0, own=round(ovh, 1)))
+        if self.n % 5 == 0: jl(F_LOG, dict(t=int(t), lv=lvl, sw=round(swap, 2), po=round(po), cpu=round(use or 0.0, 2), hold=False, nd=0, own=round(ovh, 1)))
         return st
-
-    def ai_worker(self, ctx, cands, s):
-        try:
-            raw = agent(ctx, cands, self.mode)
-            self.res = (s, valid_plan(raw, cands), cands, [str(x)[:160] for x in (raw or {}).get("advice", [])[:3]]) if raw is not None else (s, None, cands, [])
-        except Exception:  # a malformed model reply must not kill the AI thread
-            self.res = (s, None, cands, [])
 
     def tick(self):
         if os.environ.get("MONITORED_FAULT"): raise RuntimeError("fault injection (tests only)")
@@ -396,10 +260,10 @@ class Mon:
         if fg_pid is None: return  # front app unknown (lsappinfo timed out): acting now could slow the app you are using
         if fg != self.last_fg: jl(F_FG, dict(t=int(t), app=fg)); self.last_fg = fg
         # Demand, not usage: a demoted process is throttled hard, so count what it was using when we demoted it (valid 120 s). Without this the monitor flaps.
-        J0 = journal(); dem = {int(k): e for k, e in J0.items() if e["act"] == "demote" and int(k) in procs and t - e["t"] < 120}
+        J0 = journal(); dem = {int(k): e for k, e in J0.items() if int(k) in procs and t - e["t"] < 120}
         cpu_frac = (sum(p["cpu"] for p in procs.values()) - sum(procs[k]["cpu"] for k in dem) + sum(e.get("cpu", 0.0) for e in dem.values())) / (100.0 * NCPU)
         cpu_hot, mem_hot = cpu_frac >= CFG["cpu_busy"], (lvl >= 4 or (lvl >= 2 and po >= CFG["pageout_hot"]))
-        protected, priority = classify(procs, fg_pid, self.ai_protect)
+        protected, priority = classify(procs, fg_pid)
         for k in list(journal()):  # a slowed program that is now protected (you switched to it) is restored at once
             if int(k) in protected: undo(int(k), "protected")
         for x in [x for x in self.streak if x not in procs]: del self.streak[x]
@@ -411,47 +275,18 @@ class Mon:
         cands.sort(key=lambda p: -p["cpu"])
         hogs = [p for p in cands if self.streak[p["pid"]] >= CFG["hog_ticks"]]
         J = journal()
-        for pid, e in list(J.items()):  # housekeeping: forget dead pids, end pauses
+        for pid in list(J):  # housekeeping: forget dead pids
             if int(pid) not in procs: cancel_timer(J.pop(pid)); jsave(F_JOURNAL, J)
-            elif e["act"] == "pause" and t - e["t"] >= e["ttl"]: undo(int(pid), "pause ttl")
-        J = journal()
-        if self.res:  # consume a finished AI answer
-            rs, plan, rc, adv = self.res; self.res = None; self.advice = adv
-            if plan is not None:
-                self.cache[rs] = [dict(do=a["do"], name=pname(next(c for c in rc if c["pid"] == a["pid"])["cmd"]), why=a["why"], t=int(now())) for a in plan]
-                jsave(F_CACHE, self.cache)
-                for a in self.cache[rs]: self.byname[a["name"]] = a["do"]
-        names_demote, names_pause = set(), set()
         if cpu_hot:
             self.calm = 0
-            if self.mode != "off" and hogs:
-                s = sig(fg, hogs, cpu_hot, mem_hot)
-                names = {pname(h["cmd"]) for h in hogs[:3]}
-                known = {pname(h["cmd"]) for h in hogs if pname(h["cmd"]) in self.byname}  # replay by process name: every culprit with a stored decision costs no model call
-                if known: self.hits += 1
-                for n in known:
-                    do = self.byname[n]
-                    {"demote": names_demote, "pause": names_pause}.get(do, set()).add(n)
-                    if do == "protect": self.ai_protect.add(n)
-                if names - known and (self.th is None or not self.th.is_alive()) and t - self.last_ai >= CFG["ai_every"] and not (CFG["saver"] and self.on_battery()):
-                    ctx = dict(foreground=fg, priority_running=sorted({pname(procs[x]["cmd"]) for x in priority if x in procs})[:8], cpu_busy_pct=round(cpu_frac * 100), mem_pressure_level=lvl, cores=NCPU)
-                    self.last_ai, self.ai_calls = t, self.ai_calls + 1
-                    self.th = threading.Thread(target=self.ai_worker, args=(ctx, cands[:12], s), daemon=True); self.th.start()
-            todo = [(p, "demote") for p in hogs if pname(p["cmd"]) not in self.ai_protect] + [(p, "demote") for p in cands if pname(p["cmd"]) in names_demote and p["cpu"] >= CFG["hog_cpu"]]
-            npaused = sum(1 for e in J.values() if e["act"] == "pause")
-            for p in cands:
-                if pname(p["cmd"]) in names_pause and p["cpu"] >= 80 and npaused < CFG["max_pause"] and t - self.cool.get(p["pid"], 0) > CFG["pause_cooldown"]:
-                    if apply("pause", p, CFG["pause_ttl"]): self.cool[p["pid"]] = t; npaused += 1
-            seen, nd = set(), sum(1 for e in J.values() if e["act"] == "demote")
-            for p, act in todo:
-                if p["pid"] in seen or p["pid"] in protected: continue
-                seen.add(p["pid"]); e = J.get(str(p["pid"]))
-                if e and e["act"] == "pause": continue
+            nd = len(J)
+            for p in hogs:
+                e = J.get(str(p["pid"]))
                 if e and t - e["t"] < 60: continue
                 if not e and nd >= CFG["max_demote"]: continue
                 if apply("demote", p, CFG["demote_ttl"]) and not e: nd += 1
             for k, e in list(J.items()):  # keep demotions alive while demand stays high (the OS-level timer would otherwise end them at 90 s)
-                if e["act"] == "demote" and int(k) in procs and t - e["t"] >= 60: apply("demote", procs[int(k)], CFG["demote_ttl"])
+                if int(k) in procs and t - e["t"] >= 60: apply("demote", procs[int(k)], CFG["demote_ttl"])
         else:
             self.calm += 1
             if self.calm >= CFG["calm_ticks"] and J:
@@ -462,22 +297,20 @@ class Mon:
         self.sleep = ((10.0 if self.on_battery() else 6.0) if calm else (5.0 if CFG["saver"] and self.on_battery() else CFG["tick"])) if CFG["adaptive"] else CFG["tick"]
         ct = sum(os.times()[:4]); ovh = 100.0 * (ct - self.c_prev) / max(1e-6, t - self.t_prev); self.c_prev, self.t_prev = ct, t
         st = dict(ts=t, level=lvl, swap=round(swap, 3), pageout_rate=round(po, 1), cpu_frac=round(cpu_frac, 3), cpu_hot=cpu_hot, mem_hot=mem_hot, hold=mem_hot, dry=DRY,
-                  fg=fg, demoted=sorted({e["name"] for e in J.values() if e["act"] == "demote"}), paused=sorted({e["name"] for e in J.values() if e["act"] == "pause"}),
-                  ai_calls=self.ai_calls, cache_hits=self.hits, advice=self.advice, own_cpu_pct=round(ovh, 2))
+                  fg=fg, demoted=sorted({e["name"] for e in J.values()}), own_cpu_pct=round(ovh, 2))
         jsave(F_STATUS, st)
         if cpu_hot or mem_hot or J or self.n % 5 == 0:
-            jl(F_LOG, dict(t=int(t), lv=lvl, sw=round(swap, 2), po=round(po), cpu=round(cpu_frac, 2), hold=mem_hot, nd=len(st["demoted"]), np=len(st["paused"]), own=round(ovh, 1)))
+            jl(F_LOG, dict(t=int(t), lv=lvl, sw=round(swap, 2), po=round(po), cpu=round(cpu_frac, 2), hold=mem_hot, nd=len(st["demoted"]), own=round(ovh, 1)))
         return st
 
 def cmd_run(args):
     global DRY
-    mode, ticks = "auto", None
+    ticks = None
     DRY = "--dry" in args
     if "--saver" in args: CFG["saver"] = True
-    if "--ai" in args: mode = args[args.index("--ai") + 1]
     if "--ticks" in args: ticks = int(args[args.index("--ticks") + 1])
     if "--tick" in args: CFG["tick"] = float(args[args.index("--tick") + 1]); CFG["adaptive"] = False
-    for k in ("hog_ticks", "ai_every", "hog_cpu"):  # hog_cpu: tests lower it, because macOS ps shows a new process's CPU use only after about 10 s
+    for k in ("hog_ticks", "hog_cpu"):  # hog_cpu: tests lower it, because macOS ps shows a new process's CPU use only after about 10 s
         if "--" + k in args: CFG[k] = float(args[args.index("--" + k) + 1])
     import fcntl
     lk = open(DIR + "/lock", "w")
@@ -486,7 +319,7 @@ def cmd_run(args):
     revert_all("startup")
     def bye(*a): revert_all("exit"); sys.exit(0)
     signal.signal(signal.SIGINT, bye); signal.signal(signal.SIGTERM, bye)
-    m, n = Mon(mode), 0
+    m, n = Mon(), 0
     try:
         errs = 0
         while ticks is None or n < ticks:
@@ -528,40 +361,16 @@ def cmd_gate(args):
         time.sleep(2)
     jl(F_EVENTS, dict(t=int(now()), ev="gate", waited=round(now() - t0, 1), held=held, cmd=cmd[0]))
     if held: sys.stderr.write("monitored gate: waited %.0f s\n" % (now() - t0))
-    os.execvp(cmd[0], cmd)
-
-def _jlines(path):
-    """Parsed JSON lines; a line cut short by a full disk is skipped."""
-    out = []
-    if os.path.exists(path):
-        for x in open(path):
-            try: out.append(json.loads(x))
-            except ValueError: pass
-    return out
-
-def cmd_report(args):
-    rows, ev = _jlines(F_LOG), _jlines(F_EVENTS)
-    if not rows: return print("no log yet")
-    span = (rows[-1]["t"] - rows[0]["t"]) / 60.0
-    hot = sum(1 for r in rows if r["cpu"] >= CFG["cpu_busy"]); hold = sum(1 for r in rows if r["hold"])
-    print("log lines %d over %.1f min (lines are written every tick while busy, every 5th tick otherwise)" % (len(rows), span))
-    print("lines with CPU busy: %d, with memory thrash hold: %d" % (hot, hold))
-    c = defaultdict(int)
-    for e in ev: c[e["ev"]] += 1
-    print("events:", dict(c))
-    top = defaultdict(int)
-    for e in ev:
-        if e["ev"] in ("demote", "pause"): top[e["name"]] += 1
-    print("most acted on:", sorted(top.items(), key=lambda x: -x[1])[:8])
-    print("own CPU use, average %% of one core while logging: %.2f" % (sum(r["own"] for r in rows) / len(rows)))
+    try: os.execvp(cmd[0], cmd)
+    except OSError as e: sys.exit("monitored gate: cannot run %s: %s" % (cmd[0], e.strerror))
 
 # ---------- install, settings, friendly commands ----------
-__version__ = "0.2.2"
+__version__ = "0.3.0"
 LABEL = os.environ.get("MONITORED_LABEL", "com.activitymonitored.agent")
 PLIST = os.path.join(HOME, "Library", "LaunchAgents", LABEL + ".plist")
 F_SET = DIR + "/settings.json"
 SELF = os.path.abspath(__file__)
-DEFAULTS = {"mode": "on", "ai": False, "battery_saver": True}
+DEFAULTS = {"mode": "on", "battery_saver": True}
 
 def settings():
     s = dict(DEFAULTS); s.update(jload(F_SET, {})); return s
@@ -576,11 +385,11 @@ def stable_python():
 
 def stop_agent():
     if running(): lc("bootout", "gui/%d/%s" % (ME, LABEL)); time.sleep(1)
-    revert_all("stop")  # undo every slowdown and pause
+    revert_all("stop")  # undo every slowdown
 
 def write_plist(s):
     import plistlib
-    args = [stable_python(), "-I", DIR + "/monitored.py", "run", "--ai", "auto" if s["ai"] else "off"]
+    args = [stable_python(), "-I", DIR + "/monitored.py", "run"]
     if s["mode"] == "watch": args.append("--dry")
     if s["battery_saver"]: args.append("--saver")
     d = {"Label": LABEL, "ProgramArguments": args, "RunAtLoad": True, "KeepAlive": {"SuccessfulExit": False}, "ThrottleInterval": 30, "ProcessType": "Interactive",
@@ -600,13 +409,12 @@ def apply_settings():
     time.sleep(3)
     if s["mode"] == "watch": print("Activity Monitored is watching only. It logs what it would do and changes nothing.")
     else: print("Activity Monitored is on. It slows busy background programs only while your Mac is overloaded, then restores them.")
-    print("AI judgment: %s. Battery saver: %s. Running: %s." % ("on" if s["ai"] else "off", "on" if s["battery_saver"] else "off", "yes" if running() else "no"))
+    print("Battery saver: %s. Running: %s." % ("on" if s["battery_saver"] else "off", "yes" if running() else "no"))
     return 0
 
 def cmd_install(args):
     s = settings()
     if "--mode" in args: s["mode"] = args[args.index("--mode") + 1]
-    if "--ai" in args: s["ai"] = args[args.index("--ai") + 1] == "on"
     if s["mode"] not in ("on", "watch", "off"): print("mode must be on, watch or off"); return 1
     os.makedirs(DIR, exist_ok=True); os.chmod(DIR, 0o700)
     if os.path.abspath(DIR + "/monitored.py") != SELF: shutil.copy(SELF, DIR + "/monitored.py")
@@ -639,7 +447,7 @@ def set_key(k, v):
     s = settings(); s[k] = v; os.makedirs(DIR, exist_ok=True); jsave(F_SET, s); return apply_settings()
 
 def cmd_toggle(key, args):
-    if args[:1] not in (["on"], ["off"]): print("usage: monitored %s on|off" % ("ai" if key == "ai" else "battery")); return 1
+    if args[:1] not in (["on"], ["off"]): print("usage: monitored battery on|off"); return 1
     return set_key(key, args[0] == "on")
 
 def cmd_protect(args):
@@ -651,7 +459,7 @@ def cmd_status(args):
     s, st = settings(), jload(F_STATUS, {})
     fresh = bool(st) and now() - st.get("ts", 0) < 30
     word = {"on": "on", "watch": "watching only", "off": "off"}.get(s["mode"], s["mode"])
-    print("Activity Monitored is %s (AI %s, battery saver %s). %s" % (word, "on" if s["ai"] else "off", "on" if s["battery_saver"] else "off", "Running." if (fresh or running()) else "Not running."))
+    print("Activity Monitored is %s (battery saver %s). %s" % (word, "on" if s["battery_saver"] else "off", "Running." if (fresh or running()) else "Not running."))
     if fresh:
         lvl = {1: "normal", 2: "warning", 4: "critical"}.get(st.get("level"), str(st.get("level")))
         print("CPU busy: %d%%. Memory pressure: %s. Front app: %s." % (round(100 * st.get("cpu_frac", 0)), lvl, st.get("fg") or "unknown"))
@@ -666,63 +474,18 @@ def cmd_status(args):
     for e in ev:
         if e.get("ev") in ("demote", "would_demote"): names[e.get("name", "?")] += 1
     print("Last 24 hours: %d slowdowns%s." % (sum(names.values()), (", most often " + ", ".join("%s (%d)" % kv for kv in sorted(names.items(), key=lambda kv: -kv[1])[:3])) if names else ""))
-    for a in st.get("advice", [])[:3]: print("Suggestion (never done automatically): " + a)
     gb = disk_free_gb()
     if gb is not None: print("Disk free: %.0f GB%s." % (gb, " (too low: below %d GB apps can freeze)" % WARN["disk_min_gb"] if gb < WARN["disk_min_gb"] else ""))
     for e in [e for e in ev if e.get("ev") == "warn"][-3:]:
         m = int((now() - e.get("t", 0)) // 60)
         print("Warning (%s ago): %s" % ("%d h" % (m // 60) if m >= 60 else "%d min" % m, e.get("msg", "")))
 
-def cmd_privacy(args):
-    ai = settings()["ai"]
-    print("AI judgment is %s." % ("ON: for an unfamiliar situation, Activity Monitored sends names, CPU and memory of the busiest programs you own, the front app's name, and (if asked) a program's command line and folder, with secrets and your home path removed, to the `claude` program on this Mac, which uses your own Claude login" if ai else "OFF (default): nothing leaves your Mac and no account is used"))
-    p = os.path.join(DIR, "last_prompt.txt")
-    print("Exactly what the last model call received:\n" + (open(p).read() if os.path.exists(p) else "(no model call yet)"))
-
-TERM_SCRIPT = '''tell application "Terminal"
-set out to ""
-repeat with w in windows
-repeat with t in tabs of w
-set out to out & (id of w) & (character id 9) & (busy of t as text) & (character id 9) & (tty of t) & linefeed
-end repeat
-end repeat
-return out
-end tell'''
-
-def terminal_tabs():
-    """[(window id, busy, tty)] for every Terminal tab; [] when Terminal is not running or not scriptable."""
-    if "Terminal" not in run(["/bin/ps", "-axco", "comm="]).split("\n"): return []
-    rows = []
-    for line in run(["/usr/bin/osascript", "-e", TERM_SCRIPT], 10).splitlines():
-        f = line.split("\t")
-        if len(f) == 3: rows.append((f[0], f[1] == "true", f[2]))
-    return rows
-
-def cmd_terminals(args):
-    """Lists Terminal tabs: idle (only a shell), working, or waiting (a program at under 1% CPU). --close closes idle windows."""
-    tabs = terminal_tabs()
-    if not tabs: print("No Terminal windows (or Terminal did not answer)."); return
-    cpu = defaultdict(float)
-    for ln in run(["/bin/ps", "-axo", "tty=,pcpu="]).splitlines():
-        f = ln.split()
-        if len(f) == 2:
-            try: cpu["/dev/" + f[0]] += float(f[1])
-            except ValueError: pass
-    def tty_cpu(tty): return cpu[tty]
-    idle_wins = {w for w, _, _ in tabs} - {w for w, b, _ in tabs if b}  # a window closes only when every tab in it is idle
-    for w, busy, tty in tabs:
-        state = "idle (shell only)" if not busy else ("working" if tty_cpu(tty) >= 1 else "waiting (under 1% CPU: needs input, or stuck)")
-        print("%-12s %s" % (tty, state))
-    if "--close" in args and idle_wins:
-        for w in idle_wins: run(["/usr/bin/osascript", "-e", 'tell application "Terminal" to close (every window whose id is %s)' % w], 10)
-        print("Closed %d idle window(s). Busy windows were left open." % len(idle_wins))
-
 if __name__ == "__main__":
     a = sys.argv[1:]; c = a[0] if a else ""
-    table = {"run": cmd_run, "gate": cmd_gate, "report": cmd_report, "revert-all": lambda x: revert_all(), "status": cmd_status, "install": cmd_install,
-             "uninstall": cmd_uninstall, "privacy": cmd_privacy, "protect": cmd_protect, "on": lambda x: set_key("mode", "on"), "watch": lambda x: set_key("mode", "watch"),
-             "off": lambda x: set_key("mode", "off"), "ai": lambda x: cmd_toggle("ai", x), "battery": lambda x: cmd_toggle("battery_saver", x),
-             "version": lambda x: print(__version__), "terminals": cmd_terminals, "status-json": status_json}
+    table = {"run": cmd_run, "gate": cmd_gate, "revert-all": lambda x: revert_all(), "status": cmd_status, "install": cmd_install,
+             "uninstall": cmd_uninstall, "protect": cmd_protect, "on": lambda x: set_key("mode", "on"), "watch": lambda x: set_key("mode", "watch"),
+             "off": lambda x: set_key("mode", "off"), "battery": lambda x: cmd_toggle("battery_saver", x),
+             "version": lambda x: print(__version__), "status-json": status_json}
     if c not in table:
         print(__doc__)
         sys.exit(0 if c in ("", "help", "-h", "--help") else "monitored: unknown command: %s" % c)
