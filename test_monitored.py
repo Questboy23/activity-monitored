@@ -3,6 +3,7 @@
 import json, os, subprocess, sys, tempfile, time
 HERE = os.path.dirname(os.path.abspath(__file__)); SM = os.path.join(HERE, "monitored.py")
 results = []
+os.environ["MONITORED_TEST_ONLY"] = "monitored_test_"  # never slow or pause a real program during tests
 def sh(*a, env=None, t=120):
     return subprocess.run(a, capture_output=True, text=True, env=dict(os.environ, **(env or {})), timeout=t)
 def check(name, cond, detail=""):
@@ -149,6 +150,27 @@ check("unknown front app: tick takes no action", "RET None ACTED 0" in out, (out
 # gate with a missing program: a clear message and exit 1, not a Python traceback
 r = sh(sys.executable, SM, "gate", "--", "no-such-program-xyz", env={"MONITORED_DIR": tempfile.mkdtemp()})
 check("gate with a missing program prints one line and exits 1", r.returncode == 1 and "cannot run no-such-program-xyz" in r.stderr and "Traceback" not in r.stderr, r.stderr[-200:])
+
+# memory relief: a big background program is paused while memory is short, resumed when it recovers, and never by a pop-up
+MM = "monitored_test_mem"
+subprocess.run(["sh", "-c", "%s -c 'import os, time; b = os.urandom(300 << 20); time.sleep(90)' %s >/dev/null 2>&1 &" % (sys.executable, MM)])
+time.sleep(2); mp = sh("pgrep", "-f", MM).stdout.split()
+dm = tempfile.mkdtemp()
+r = sh(sys.executable, SM, "run", "--ticks", "16", "--tick", "0.5", env={"MONITORED_DIR": dm, "MONITORED_FAKE_LEVEL": "4"}, t=60)
+ev = jl(dm + "/events.jsonl")
+check("memory short: biggest background program paused", any(e.get("ev") == "pause" for e in ev) and mp, [e.get("ev") for e in ev][:6])
+check("monitor exit resumes the paused program", mp and "T" not in stat(mp[0]), stat(mp[0]) if mp else "no hog")
+w = subprocess.Popen([sys.executable, SM, "run", "--tick", "0.5"], env=dict(os.environ, MONITORED_DIR=dm, MONITORED_FAKE_LEVEL="4"))
+t0 = time.time()
+while time.time() - t0 < 30 and not (mp and "T" in stat(mp[0])): time.sleep(0.5)  # slow on a loaded Mac
+paused = mp and "T" in stat(mp[0]); w.kill(); w.wait(); time.sleep(0.5)  # SIGKILL: the monitor gets no chance to undo
+still = mp and "T" in stat(mp[0])
+check("crash safety: paused program stays paused only until its own timer", paused and still, (paused, still))
+J = json.load(open(dm + "/journal.json")); tp = J.get(mp[0], {}).get("timer") if mp else None
+if tp: os.killpg(int(tp), 9)  # run the timer's job now instead of waiting 2 minutes
+if mp: os.kill(int(mp[0]), 18)
+check("no pop-up code left", "osascript" not in open(SM).read())
+subprocess.run(["pkill", "-f", MM])
 
 print("\n%d of %d passed" % (sum(results), len(results)))
 sys.exit(0 if all(results) else 1)

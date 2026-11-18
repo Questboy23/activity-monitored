@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Activity Monitored: keeps a Mac responsive when it is overloaded. macOS only, Python 3.8+, no packages to install.
-While the CPU is oversubscribed, Activity Monitored lowers the priority of busy background programs (taskpolicy -b), then restores them. Every action is undone by a timer.
+While the CPU is oversubscribed, it lowers the priority of busy background programs (taskpolicy -b). While memory runs out, it
+pauses the biggest background command-line program (never an app with a window) and resumes it when memory recovers.
+Every action is undone by an OS-level timer, even if Activity Monitored crashes. It never shows a pop-up, quits or deletes anything.
   monitored install           install and start (one command; see README)
   monitored status            what Activity Monitored is doing right now and in the last 24 hours
   monitored on | watch | off  on: act. watch: log what it would do, change nothing. off: stop and undo everything
@@ -145,8 +147,10 @@ def classify(procs, fg_pid):
         if (PRIORITY.search(p["cmd"]) or (up and up.search(p["cmd"]))) and p["pid"] != os.getpid(): priority |= tree(kids, p["pid"])
     return protected | priority, priority
 
+TEST_ONLY = os.environ.get("MONITORED_TEST_ONLY")  # tests: touch only processes whose command contains this mark
+
 def eligible(p):
-    if p["uid"] != ME: return False
+    if p["uid"] != ME or (TEST_ONLY and TEST_ONLY not in p["cmd"]): return False
     n = pname(p["cmd"])
     if SYSTEM_PATH.match(p["cmd"]) and n not in BG_OK: return False
     return "T" not in p["stat"]
@@ -174,13 +178,10 @@ _warned, _wstate = {}, dict(disk_t=0.0, mem=0)
 def disk_free_gb():
     try: v = os.statvfs(HOME); return v.f_bavail * v.f_frsize / 1e9
     except OSError: return None
-def notify(key, msg):  # at most one warning per kind every 30 minutes
+def notify(key, msg):  # written to the status log only, at most once per kind every 30 minutes: Activity Monitored never shows a pop-up
     t = now()
     if t - _warned.get(key, 0) < WARN["every"]: return False
     _warned[key] = t; jl(F_EVENTS, dict(t=int(t), ev="warn", kind=key, msg=msg))
-    if not os.environ.get("MONITORED_NO_NOTIFY"):
-        try: subprocess.Popen(["/usr/bin/osascript", "-e", "on run a", "-e", 'display notification (item 1 of a) with title "Activity Monitored"', "-e", "end run", msg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except OSError: pass
     return True
 def warn_check(lvl, swap, mem_hot):
     t = now()
@@ -191,7 +192,7 @@ def warn_check(lvl, swap, mem_hot):
     _wstate["mem"] = _wstate["mem"] + 1 if (mem_hot or (lvl is not None and lvl >= 2 and swap >= WARN["swap_full"])) else 0
     if _wstate["mem"] >= WARN["mem_ticks"] and t - _warned.get("memory", 0) >= WARN["every"]:  # check the limit first: ps is costly while memory is short
         top = sorted(sample().values(), key=lambda p: -p["rss"])[:3]
-        if notify("memory", "Memory exhausted (swap %d%% full). Biggest: %s. Quit one to avoid a freeze." % (round(100 * swap), ", ".join("%s %.1f GB" % (pname(p["cmd"]), p["rss"] / 1e9) for p in top))): _wstate["mem"] = 0
+        if notify("memory", "Memory exhausted (swap %d%% full). Biggest: %s." % (round(100 * swap), ", ".join("%s %.1f GB" % (pname(p["cmd"]), p["rss"] / 1e9) for p in top))): _wstate["mem"] = 0
 def apply(act, p, ttl):
     pid, J = p["pid"], journal()
     if DRY:  # log what would happen, change nothing
@@ -208,11 +209,49 @@ def apply(act, p, ttl):
         jl(F_EVENTS, dict(t=int(now()), ev=act, pid=pid, name=pname(p["cmd"]), cpu=p["cpu"]))
     return True
 
+MEM = dict(min_rss=100e6, max_paused=3, ttl=120, max_hold=600, hot_ticks=2, calm_ticks=3)
+
+APP_PART = re.compile(r"\.app/Contents/(Frameworks|Helpers|XPCServices|PlugIns|Library)/| Helper\b")
+
+def footprint(pid):
+    """Memory a program really uses, including the part macOS compressed or swapped out (Activity Monitor's Memory
+    column). Resident size alone drops to almost nothing for the very program that is filling swap."""
+    buf = (ctypes.c_uint8 * 96)()
+    if _LIB is None or _LIB.proc_pid_rusage(int(pid), 0, buf) != 0: return 0
+    return int.from_bytes(bytes(buf[72:80]), "little")  # rusage_info_v0.ri_phys_footprint
+
+def gui_pids():
+    """Processes macOS lists as apps (Dock icon or menu bar item)."""
+    return {int(x) for x in re.findall(r"pid = (\d+)", run(["/usr/bin/lsappinfo", "list"], 8))}
+
+def pausable(p, protected, apps):
+    """Memory relief only pauses your own background work (scripts, builds, servers): never an app, an app's helper,
+    a system program, or anything protected. A paused program keeps its memory and state."""
+    return p["pid"] not in protected and p["pid"] not in apps and eligible(p) and not APP_PART.search(p["cmd"])
+
+def pause(p, since=None):
+    """Freezes one program so it stops taking memory. An OS-level timer unfreezes it after 2 minutes even if Activity
+    Monitored crashes; while memory stays short the timer is renewed, at most 10 minutes in all."""
+    pid, J = p["pid"], journal()
+    if DRY:
+        jl(F_EVENTS, dict(t=int(now()), ev="would_pause", pid=pid, name=pname(p["cmd"]), rss=p["rss"])); return False
+    timer = dead_man("/bin/kill -CONT %d" % int(pid), MEM["ttl"])  # undo timer first, as for demote
+    try: os.kill(pid, signal.SIGSTOP)
+    except OSError: cancel_timer({"timer": timer}); return False
+    old = J.get(str(pid)); cancel_timer(old)
+    J[str(pid)] = dict(act="pause", name=pname(p["cmd"]), t=now(), ttl=MEM["ttl"], since=since or now(), rss=p["rss"], timer=timer)
+    jsave(F_JOURNAL, J)
+    if not since: jl(F_EVENTS, dict(t=int(now()), ev="pause", pid=pid, name=pname(p["cmd"]), rss=p["rss"]))
+    return True
+
 def undo(pid, why):
     J = journal(); e = J.pop(str(pid), None)
     if e is None: return
     cancel_timer(e)
-    subprocess.run(["/usr/sbin/taskpolicy", "-B", "-p", str(pid)], capture_output=True)
+    if e["act"] == "pause":
+        try: os.kill(int(pid), signal.SIGCONT)
+        except OSError: pass
+    else: subprocess.run(["/usr/sbin/taskpolicy", "-B", "-p", str(pid)], capture_output=True)
     jsave(F_JOURNAL, J)
     jl(F_EVENTS, dict(t=int(now()), ev="undo_" + e["act"], pid=int(pid), name=e["name"], why=why))
 
@@ -224,6 +263,7 @@ class Mon:
         self.streak, self.calm, self.n = defaultdict(int), 0, 0
         self.last_fg, self.t_prev, self.c_prev = None, now(), sum(os.times()[:4])
         self.sleep, self.batt, self.tk0, self.fg_t = CFG["tick"], (0.0, False), None, 0.0
+        self.mhot = self.mcalm = 0
 
     def on_battery(self):  # checked at most once a minute
         if now() - self.batt[0] > 60: self.batt = (now(), "Battery Power" in run(["/usr/bin/pmset", "-g", "batt"]))
@@ -249,6 +289,22 @@ class Mon:
         jsave(F_STATUS, st)
         if self.n % 5 == 0: jl(F_LOG, dict(t=int(t), lv=lvl, sw=round(swap, 2), po=round(po), cpu=round(use or 0.0, 2), hold=False, nd=0, own=round(ovh, 1)))
         return st
+
+    def relieve(self, procs, protected, mem_hot, t):
+        """Memory short for 2 checks: pause the biggest background program. Memory fine for 3 checks: resume one per check."""
+        self.mhot, self.mcalm = (self.mhot + 1, 0) if mem_hot else (0, self.mcalm + 1)
+        paused = {k: e for k, e in journal().items() if e["act"] == "pause"}
+        for k, e in paused.items():
+            if int(k) in procs and mem_hot and t - e["t"] >= 60:
+                if t - e["since"] < MEM["max_hold"]: pause(procs[int(k)], since=e["since"])
+                else: undo(int(k), "max-hold")  # never keep anything frozen for long
+        if self.mhot >= MEM["hot_ticks"] and len(paused) < MEM["max_paused"]:
+            apps = gui_pids()
+            cands = [(footprint(p["pid"]), p) for p in procs.values() if str(p["pid"]) not in paused and pausable(p, protected, apps)]
+            cands = sorted((c for c in cands if c[0] >= MEM["min_rss"]), key=lambda c: -c[0])
+            if cands: p = dict(cands[0][1], rss=cands[0][0]); pause(p); self.mhot = 0  # one at a time: give the Mac a check to recover before the next
+        elif self.mcalm >= MEM["calm_ticks"] and paused:
+            undo(int(min(paused, key=lambda k: paused[k]["rss"])), "memory-ok"); self.mcalm = 0  # smallest first: least likely to refill memory
 
     def tick(self):
         if os.environ.get("MONITORED_FAULT"): raise RuntimeError("fault injection (tests only)")
@@ -282,16 +338,17 @@ class Mon:
             nd = len(J)
             for p in hogs:
                 e = J.get(str(p["pid"]))
-                if e and t - e["t"] < 60: continue
+                if e and (e["act"] != "demote" or t - e["t"] < 60): continue
                 if not e and nd >= CFG["max_demote"]: continue
                 if apply("demote", p, CFG["demote_ttl"]) and not e: nd += 1
             for k, e in list(J.items()):  # keep demotions alive while demand stays high (the OS-level timer would otherwise end them at 90 s)
-                if int(k) in procs and t - e["t"] >= 60: apply("demote", procs[int(k)], CFG["demote_ttl"])
+                if e["act"] == "demote" and int(k) in procs and t - e["t"] >= 60: apply("demote", procs[int(k)], CFG["demote_ttl"])
         else:
             self.calm += 1
             if self.calm >= CFG["calm_ticks"] and J:
                 for pid, e in list(J.items()):
-                    if t - e["t"] >= 30: undo(int(pid), "calm")  # minimum hold 30 s
+                    if e["act"] == "demote" and t - e["t"] >= 30: undo(int(pid), "calm")  # minimum hold 30 s
+        self.relieve(procs, protected, mem_hot, t)
         J = journal(); warn_check(lvl, swap, mem_hot)
         calm = cpu_frac < CFG["scan_at"] and not mem_hot and not J  # calm: check less often (6 s on power, 10 s on battery); busy: every 3 s
         self.sleep = ((10.0 if self.on_battery() else 6.0) if calm else (5.0 if CFG["saver"] and self.on_battery() else CFG["tick"])) if CFG["adaptive"] else CFG["tick"]
@@ -365,7 +422,7 @@ def cmd_gate(args):
     except OSError as e: sys.exit("monitored gate: cannot run %s: %s" % (cmd[0], e.strerror))
 
 # ---------- install, settings, friendly commands ----------
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 LABEL = os.environ.get("MONITORED_LABEL", "com.activitymonitored.agent")
 PLIST = os.path.join(HOME, "Library", "LaunchAgents", LABEL + ".plist")
 F_SET = DIR + "/settings.json"
@@ -463,7 +520,7 @@ def cmd_status(args):
     if fresh:
         lvl = {1: "normal", 2: "warning", 4: "critical"}.get(st.get("level"), str(st.get("level")))
         print("CPU busy: %d%%. Memory pressure: %s. Front app: %s." % (round(100 * st.get("cpu_frac", 0)), lvl, st.get("fg") or "unknown"))
-        print("Slowed right now: %s." % (", ".join(st.get("demoted", [])) or "nothing"))
+        print("Slowed or paused right now: %s." % (", ".join(st.get("demoted", [])) or "nothing"))
     ev = []
     if os.path.exists(F_EVENTS):
         for x in open(F_EVENTS):
@@ -472,13 +529,13 @@ def cmd_status(args):
             if now() - e.get("t", 0) < 86400: ev.append(e)
     names = defaultdict(int)
     for e in ev:
-        if e.get("ev") in ("demote", "would_demote"): names[e.get("name", "?")] += 1
-    print("Last 24 hours: %d slowdowns%s." % (sum(names.values()), (", most often " + ", ".join("%s (%d)" % kv for kv in sorted(names.items(), key=lambda kv: -kv[1])[:3])) if names else ""))
+        if e.get("ev") in ("demote", "would_demote", "pause", "would_pause"): names[e.get("name", "?")] += 1
+    print("Last 24 hours: %d slowdowns or pauses%s." % (sum(names.values()), (", most often " + ", ".join("%s (%d)" % kv for kv in sorted(names.items(), key=lambda kv: -kv[1])[:3])) if names else ""))
     gb = disk_free_gb()
     if gb is not None: print("Disk free: %.0f GB%s." % (gb, " (too low: below %d GB apps can freeze)" % WARN["disk_min_gb"] if gb < WARN["disk_min_gb"] else ""))
     for e in [e for e in ev if e.get("ev") == "warn"][-3:]:
         m = int((now() - e.get("t", 0)) // 60)
-        print("Warning (%s ago): %s" % ("%d h" % (m // 60) if m >= 60 else "%d min" % m, e.get("msg", "")))
+        print("Noted (%s ago): %s" % ("%d h" % (m // 60) if m >= 60 else "%d min" % m, e.get("msg", "")))
 
 if __name__ == "__main__":
     a = sys.argv[1:]; c = a[0] if a else ""

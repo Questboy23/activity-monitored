@@ -11,7 +11,8 @@ A Mac has a fixed amount of processor time. When more programs ask for it than e
 3. **Pick culprits.** A program becomes a culprit when all of these hold: it is yours, it is not protected, it used more than 20% of one core for three checks in a row (about 9 seconds), and the whole Mac is at least 75% busy.
 4. **Slow it down.** It marks the culprit as a background program. macOS then gives it lower priority, runs it on the low-power cores of an Apple silicon Mac, and slows its disk and network use. Nothing is killed, paused, or changed in the program.
 5. **Undo it.** After the Mac has been calm for three checks (and the slowdown is at least 30 seconds old), the program is restored. A second timer, set at the moment of the slowdown, restores it after 90 seconds no matter what, even if Activity Monitored crashes or is removed. If you switch to a slowed program, it is restored within one check. While the overload continues, the slowdown is renewed each minute.
-6. **Warn about what slowing cannot fix.** It shows a macOS notification, at most once per 30 minutes for each kind, when free disk space drops below 20 GB (macOS needs it for swap, and a full disk freezes apps), when memory stays exhausted (swap over 90% full) for about 10 checks, naming the 3 biggest programs. It never quits anything; you decide.
+6. **Relieve memory.** When macOS reports memory pressure for 2 checks in a row, it pauses (SIGSTOP) the background program with the biggest memory footprint, counting memory macOS compressed or swapped out. A separate timer process resumes it after 2 minutes even if Activity Monitored crashes; the timer is renewed while memory stays short, for at most 10 minutes. After 3 calm checks it resumes one paused program per check, smallest first. Apps with a Dock or menu bar icon, their helpers, system programs and protected work are never paused.
+7. **Stay silent.** Low disk space and exhausted memory are written to `monitored status`. Nothing ever pops up.
 7. **Hold new work.** `monitored gate -- COMMAND` waits (at most 120 seconds; change with `--max-wait S`) until memory is not thrashing, then starts the command.
 
 ## Protected by default
@@ -25,7 +26,7 @@ What remains are background programs you did not ask for: helper processes stuck
 
 ## What it never does
 
-It never quits, pauses or kills a program, deletes or edits your files, sends anything over the network, asks for an admin password, or touches another user's programs.
+It never quits or kills a program, deletes or edits your files, sends anything over the network, asks for an admin password, or touches another user's programs.
 
 ## Why it is different from current options
 

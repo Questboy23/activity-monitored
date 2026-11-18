@@ -7,7 +7,7 @@
 
 **Synthetic overload test: a 10-process job finished in 24.2 s instead of 39.3 s (one Mac, best case).**
 
-**Activity Monitored keeps your Mac responsive when it is overloaded.** While too many programs fight for the CPU, it lowers the priority of the busy background ones, then restores them. Every change is undone automatically. It also warns you when the disk is nearly full, memory is exhausted, or one program keeps hogging the CPU, because slowing programs cannot fix those.
+**Activity Monitored keeps your Mac responsive when it is overloaded, and you never see it.** While too many programs fight for the CPU, it lowers the priority of the busy background ones. While memory runs out, it pauses the background program using the most memory, so it stops filling memory, and resumes it as soon as memory recovers. Every change undoes itself through a timer that runs even if Activity Monitored crashes. It never shows a pop-up.
 
 ## Install (about 30 seconds)
 
@@ -53,7 +53,9 @@ macOS shows a "Background Items Added" notice for `python3` the first time. That
 
 ## Safety
 
-- It lowers priority only (`taskpolicy -b`), and on Apple silicon that also moves the program to the efficiency cores. It never quits, pauses or deletes anything.
+- For the CPU it lowers priority (`taskpolicy -b`), and on Apple silicon that also moves the program to the efficiency cores.
+- For memory it pauses one background program at a time, at most 3, each for at most 10 minutes. It only pauses your own command-line work (scripts, builds, local servers, measured by macOS's own memory count). It never pauses an app with a Dock or menu bar icon, an app's helpers, a system program, the front app, or protected work (calls, music, video, builds, AI agents). A paused program keeps all its memory and state.
+- It never quits, kills or deletes anything, and never shows a notification. Disk and memory notes go to `monitored status` only.
 - Every slowdown has its own macOS timer (90 s). If Activity Monitored crashes or is removed, programs speed up again by themselves. Test: killing Activity Monitored right after a slowdown restored the program 6 s later.
 - It never touches the app you are using and its helpers, system programs (WindowServer, Finder, Dock), Terminal, or media, call and developer tools (Spotify, Zoom, FaceTime, Discord, OBS, Logic Pro, GarageBand, Ableton, Music, Teams, Claude, ollama, pytest, cargo, npm run).
 - Work you started on purpose is protected too: builds and tests, renders (ffmpeg, HandBrake, Final Cut, Premiere, DaVinci, Blender), virtual machines, containers, and local databases and servers. The full list is in `HOW_IT_WORKS.md`.
@@ -82,7 +84,7 @@ macOS shows a "Background Items Added" notice for `python3` the first time. That
 ## Limitations
 
 - macOS only. Tested on one MacBook Air (Apple silicon, macOS 26.7). Intel Macs and older macOS are untested.
-- Early release (0.3.0). The only benchmark is synthetic, has 3 runs per arm and ran on one Mac. No speedup on real work is measured.
+- Early release (0.4.0). The only benchmark is synthetic, has 3 runs per arm and ran on one Mac. No speedup on real work is measured.
 - Not compared against App Tamer, Process Lasso-style tools or plain macOS.
 - `test_monitored.py` needs macOS. 23 of 23 pass on the author's Mac.
 - Activity Monitored cannot free memory. It can only delay starting new jobs.
