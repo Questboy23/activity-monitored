@@ -501,7 +501,7 @@ class Mon:
         self.last_fg, self.t_prev, self.c_prev = None, now(), sum(os.times()[:4])
         self.sleep, self.batt, self.tk0, self.fg_t = CFG["tick"], (0.0, False), None, 0.0
         self.mhot = self.mcalm = 0
-        self.severe, self.fg_pid, self.disk_t, self.dw, self.swap_prev, self.held = False, None, 0.0, {}, None, {}
+        self.severe, self.fg_pid, self.disk_t, self.dw, self.swap_prev, self.held = False, None, 0.0, {}, [], {}
 
     def disk(self, t, procs=None, fg_pid=None):
         """Keeps free disk at or above the target (30 GB unless set with `monitored disk-target GB`), once a minute.
@@ -518,10 +518,13 @@ class Mon:
         dp = {k: e for k, e in journal().items() if e["act"] == "dpause"}
         self.held = {k: v for k, v in self.held.items() if t - v < 3600}  # released after max-hold: not paused again for an hour
         sw = swap_used_gb()
-        grew, self.swap_prev = (sw is not None and self.swap_prev is not None and sw - self.swap_prev >= DISK["swap_grow"]), sw
+        # compared with the lowest reading of the last 5 minutes: a big program churning swap swings it 2 GB up and down
+        # each minute (Nov 19, run_bench.py at 22 GB), so a check against only the last reading kept missing it
+        self.swap_prev = [(a, b) for a, b in self.swap_prev if t - a <= 300] + ([(t, sw)] if sw is not None else [])
+        grew = sw is not None and len(self.swap_prev) > 1 and sw - min(b for _, b in self.swap_prev) >= DISK["swap_grow"]
         if gb >= T / 2:
             for k in dp: undo(int(k), "disk-ok")
-            self.dw = {}; return
+            self.dw, self.swap_prev = {}, []; return
         procs = procs or sample()
         if not procs: return
         for k, e in dp.items():  # still short: renew the pause (the OS timer resumes it if this monitor dies)
