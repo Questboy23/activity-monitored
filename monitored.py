@@ -275,7 +275,7 @@ def revert_all(why="revert-all"):
 
 
 # ---------- disk relief: frees space without deleting anything, and records every change so it can be reversed ----------
-DISK = dict(max_hold=float(os.environ.get("MONITORED_DISK_MAX_HOLD", str(3 * 3600))), pause_below=3.0, min_rate=1e6, swap_grow=0.25, min_mem=500e6, every=float(os.environ.get("MONITORED_DISK_EVERY", "60")), max_paused=2, ttl=150,
+DISK = dict(max_hold=float(os.environ.get("MONITORED_DISK_MAX_HOLD", str(3 * 3600))), pause_below=3.0, min_rate=1e6, swap_grow=0.25, min_mem=float(os.environ.get("MONITORED_DISK_MIN_MEM", "500e6")), every=float(os.environ.get("MONITORED_DISK_EVERY", "60")), max_paused=2, ttl=150, end_after=float(os.environ.get("MONITORED_DISK_END_AFTER", "900")), end_mem=float(os.environ.get("MONITORED_DISK_END_MEM", "2e9")),
             min_size=8e6, min_age=3 * 86400, retry=6 * 3600)
 def disk_target():
     """Free space to keep, in GB: `monitored disk-target GB` (default 30)."""
@@ -293,6 +293,27 @@ def swap_used_gb():
     return float(m[0]) / 1024 if m else None
 
 F_COMP, F_CSTATE = DIR + "/compressed.jsonl", DIR + "/compress-state.json"
+F_STOPPED = DIR + "/stopped.jsonl"  # programs ended to save the Mac, with the command and folder to rerun them
+
+def end_paused(q, e, f):
+    """A paused program keeps all its memory, and macOS keeps it in swap files on this disk. Nov 19: run_bench.py
+    sat paused for 4 hours holding 22 GB of swap, the disk hit 0 GB free and apps froze. Ending it is the only way to
+    free that room. Records the exact command and folder first, so it can be run again."""
+    pid = q["pid"]
+    cwd = re.findall(r"^n(.*)$", run(["/usr/sbin/lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"]), re.M)
+    jl(F_STOPPED, dict(t=int(now()), name=e["name"], cmd=q["cmd"], cwd=cwd[0] if cwd else "", gb=round(f / 1e9, 1)))
+    J = journal(); J.pop(str(pid), None); cancel_timer(e); jsave(F_JOURNAL, J)
+    try: os.kill(pid, signal.SIGTERM); os.kill(pid, signal.SIGCONT)  # a stopped program only sees SIGTERM once resumed
+    except OSError: return
+    for _ in range(20):
+        time.sleep(0.5)
+        try: os.kill(pid, 0)
+        except OSError: break
+    else:
+        if pname(run(["/bin/ps", "-o", "command=", "-p", str(pid)]).strip()) == e["name"]: os.kill(pid, signal.SIGKILL)
+    jl(F_EVENTS, dict(t=int(now()), ev="end", pid=pid, name=e["name"], rss=int(f)))
+    notify("end", "Ended %s: it was paused and held %.0f GB of swap while the disk was nearly full. Rerun: cd %s && %s" % (e["name"], f / 1e9, cwd[0] if cwd else "~", q["cmd"]))
+
 SKIP_EXT = set("zip gz tgz xz bz2 zst lz4 7z rar dmg iso pkg sparseimage sparsebundle jpg jpeg png heic gif webp avif mp4 mov m4v mkv avi webm mp3 m4a aac flac ogg opus "
                "gguf safetensors pt pth onnx bin ckpt npz parquet sqlite db sqlite3 wal shm lock pack idx".split())
 
@@ -506,6 +527,7 @@ class Mon:
         for k, e in dp.items():  # still short: renew the pause (the OS timer resumes it if this monitor dies)
             q = procs.get(int(k))
             if not q or pname(q["cmd"]) != e["name"]: undo(int(k), "gone")  # exited; its pid may now belong to another program
+            elif gb < T / 3 and t - e["since"] >= DISK["end_after"] and footprint(int(k)) >= DISK["end_mem"]: end_paused(q, e, footprint(int(k)))
             elif t - e["since"] >= DISK["max_hold"]: undo(int(k), "max-hold"); self.held[int(k)] = t  # never hold anything for days
             else: pause(q, since=e["since"], act="dpause", ttl=DISK["ttl"])
         w = {pid: proc_written(pid) for pid, p in procs.items() if p["uid"] == ME}
@@ -811,6 +833,8 @@ def cmd_status(args):
     cl = comp_log()
     if cl: print("Compressed to free space: %d files, %.1f GB saved. Nothing was deleted; files open exactly as before. Undo: monitored uncompress (runs by itself above 60 GB free)."
                  % (len(cl), sum(e["before"] - e["after"] for e in cl.values()) / 1e9))
+    for e in [e for e in ([json.loads(x) for x in open(F_STOPPED)] if os.path.exists(F_STOPPED) else []) if now() - e.get("t", 0) < 7 * 86400][-3:]:
+        print("Ended to keep the Mac running: %s (%.0f GB). Rerun: cd %s && %s" % (e["name"], e["gb"], e["cwd"] or "~", e["cmd"]))
     for e in [e for e in ev if e.get("ev") == "warn"][-3:]:
         m = int((now() - e.get("t", 0)) // 60)
         print("Noted (%s ago): %s" % ("%d h" % (m // 60) if m >= 60 else "%d min" % m, e.get("msg", "")))

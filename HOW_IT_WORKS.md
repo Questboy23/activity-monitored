@@ -28,7 +28,7 @@ What remains are background programs you did not ask for: helper processes stuck
 
 ## What it never does
 
-It never quits or kills a program, deletes your files or changes what is in them (compression keeps every byte), sends anything over the network, asks for an admin password, or touches another user's programs.
+It never quits an app. One exception for scripts: if a background script stays paused for 15 minutes, holds over 2 GB of swap and the disk is under a third of the target, it is ended, because a paused program keeps its memory in swap on the disk and only ending it frees that room. The exact command and folder to rerun it are saved and shown in `monitored status`. It never deletes your files or changes what is in them (compression keeps every byte), sends anything over the network, asks for an admin password, or touches another user's programs.
 
 ## Why it is different from current options
 

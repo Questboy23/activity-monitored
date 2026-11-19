@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Tests for monitored. Run: python3 test_monitored.py. Each test uses its own temp state dir and cleans up its processes."""
 import json, os, subprocess, sys, tempfile, time
+import atexit, signal
+# never leave test programs or a test monitor running if the suite stops early (Nov 19: two leaked hogs held 1.2 GB for hours)
+atexit.register(lambda: subprocess.run(["/usr/bin/pkill", "-f", "monitored_test_|activity-monitored/monitored.py run"]))
+_st = os.statvfs(os.path.expanduser("~"))
+if _st.f_bavail * _st.f_frsize < 15e9: sys.exit("Not running: under 15 GB free. The tests need a little room and must never strain this Mac.")
+signal.signal(signal.SIGTERM, lambda *a: sys.exit(1)); signal.signal(signal.SIGHUP, lambda *a: sys.exit(1))
 HERE = os.path.dirname(os.path.abspath(__file__)); SM = os.path.join(HERE, "monitored.py")
 results = []
 os.environ["MONITORED_TEST_ONLY"] = "monitored_test_"  # never slow or pause a real program during tests
@@ -231,14 +237,14 @@ check("emergency rule never pauses the app, its helpers, claude or the front app
 
 # emergency end to end: the only big program is protected (as scripts under Claude are), memory is short and swap full
 EM = "monitored_test_emg"
-eh = subprocess.Popen(["/usr/bin/python3", "-c", "b=bytearray(300*1024*1024)\nfor i in range(0,len(b),4096): b[i]=1\nimport time\nwhile True: time.sleep(1)", EM], start_new_session=True); time.sleep(3)
+eh = subprocess.Popen(["/usr/bin/python3", "-c", "b=bytearray(100*1024*1024)\nfor i in range(0,len(b),4096): b[i]=1\nimport time\nwhile True: time.sleep(1)", EM], start_new_session=True); time.sleep(3)
 os.environ["MONITORED_TEST_ONLY"] = EM; M.TEST_ONLY = EM
 mo = M.Mon(); mo.severe, mo.fg_pid = True, 1
 pr = M.sample(); prot = {eh.pid}
 for _ in range(3): mo.relieve(pr, prot, True, time.time())
 s_e = stat(eh.pid); M.revert_all("test"); s_after = stat(eh.pid); eh.kill()
 check("memory emergency pauses a protected script, and undo resumes it", "T" in s_e and "T" not in s_after, (s_e, s_after))
-mo2 = M.Mon(); mo2.severe = False; eh2 = subprocess.Popen(["/usr/bin/python3", "-c", "b=bytearray(300*1024*1024)\nfor i in range(0,len(b),4096): b[i]=1\nimport time\nwhile True: time.sleep(1)", EM], start_new_session=True); time.sleep(3)
+mo2 = M.Mon(); mo2.severe = False; eh2 = subprocess.Popen(["/usr/bin/python3", "-c", "b=bytearray(100*1024*1024)\nfor i in range(0,len(b),4096): b[i]=1\nimport time\nwhile True: time.sleep(1)", EM], start_new_session=True); time.sleep(3)
 for _ in range(3): mo2.relieve(M.sample(), {eh2.pid}, True, time.time())
 check("without a swap emergency a protected script is left alone", "T" not in stat(eh2.pid), stat(eh2.pid)); M.revert_all("test"); eh2.kill()
 os.environ["MONITORED_TEST_ONLY"] = "monitored_test_"
@@ -246,8 +252,8 @@ os.environ["MONITORED_TEST_ONLY"] = "monitored_test_"
 # threshold: below a third of the target while swap keeps growing, pause the biggest memory user; resume at half the target
 ds = tempfile.mkdtemp(); fd_, fs_ = ds + "/free", ds + "/swap"; open(fd_, "w").write("8"); open(fs_, "w").write("1")
 SM2 = "monitored_test_swap"
-sh_ = subprocess.Popen(["/usr/bin/python3", "-c", "b=bytearray(600*1024*1024)\nfor i in range(0,len(b),4096): b[i]=1\nimport time\nwhile True: time.sleep(1)", SM2], start_new_session=True); time.sleep(3)
-env3 = {"MONITORED_DIR": ds, "MONITORED_FAKE_DISK": fd_, "MONITORED_FAKE_SWAP": fs_, "MONITORED_DISK_EVERY": "2", "MONITORED_COMPRESS_ROOTS": ds, "MONITORED_DISK_TARGET": "30", "MONITORED_TEST_ONLY": SM2}
+sh_ = subprocess.Popen(["/usr/bin/python3", "-c", "b=bytearray(150*1024*1024)\nfor i in range(0,len(b),4096): b[i]=1\nimport time\nwhile True: time.sleep(1)", SM2], start_new_session=True); time.sleep(3)
+env3 = {"MONITORED_DIR": ds, "MONITORED_FAKE_DISK": fd_, "MONITORED_FAKE_SWAP": fs_, "MONITORED_DISK_EVERY": "2", "MONITORED_COMPRESS_ROOTS": ds, "MONITORED_DISK_TARGET": "30", "MONITORED_TEST_ONLY": SM2, "MONITORED_DISK_MIN_MEM": "1e8"}
 mon3 = subprocess.Popen([sys.executable, SM, "run", "--tick", "1"], env=dict(os.environ, **env3))
 time.sleep(3); st3 = ""
 for i in range(15):
@@ -262,7 +268,21 @@ check("it resumes once half the target is free", "T" not in st4, st4)
 open(fd_, "w").write("8")  # swap stays at 100: not growing
 for _ in range(6): time.sleep(1)
 check("swap not growing: nothing paused even below a third of the target", "T" not in stat(sh_.pid), stat(sh_.pid))
-mon3.terminate(); mon3.wait(); sh_.kill()
+# a program paused for the disk that still holds GBs of swap gets ended, with its command recorded to rerun
+open(fd_, "w").write("8")
+os.kill(sh_.pid, signal.SIGCONT); mon3.terminate(); mon3.wait()
+env4 = dict(env3, MONITORED_DISK_END_AFTER="3", MONITORED_DISK_END_MEM="1e8")
+mon4 = subprocess.Popen([sys.executable, SM, "run", "--tick", "1"], env=dict(os.environ, **env4))
+gone = False
+for i in range(40):
+    time.sleep(1); open(fs_, "w").write(str(200 + i))
+    if sh_.poll() is not None: gone = True; break
+stp = jl(ds + "/stopped.jsonl")
+check("paused program holding swap with the disk nearly full is ended", gone, stat(sh_.pid))
+check("its command and folder are recorded to rerun it", stp and SM2 in stp[-1]["cmd"] and stp[-1]["cwd"], stp)
+r = sh(sys.executable, SM, "status", env={"MONITORED_DIR": ds})
+check("status shows how to rerun it", "Rerun:" in r.stdout, r.stdout[-300:])
+mon4.terminate(); mon4.wait(); sh_.kill()
 r = sh(sys.executable, SM, "disk-target", "45", env={"MONITORED_DIR": ds}); r2 = sh(sys.executable, SM, "disk-target", "2", env={"MONITORED_DIR": ds})
 workers = [e for e in jl(ds + "/events.jsonl") if e.get("ev") == "worker"]
 check("only one compressor at a time while the disk stays short", len(workers) <= 2, len(workers))
