@@ -321,23 +321,34 @@ def open_paths():
     out = run(["/usr/sbin/lsof", "-n", "-w", "-Fn", "-u", str(ME)], 60)
     return {l[1:] for l in out.splitlines() if l.startswith("n/")}
 
+def spotlight(root):
+    """Big files under root from the Spotlight index, or None when Spotlight has nothing for it (not indexed, or off)."""
+    out = run(["/usr/bin/mdfind", "-onlyin", root, "kMDItemFSSize >= %d" % int(DISK["min_size"])], 300)
+    paths = [l for l in out.splitlines() if l.startswith(root + "/")]
+    return paths or None
+
 def candidates():
     """Big, idle, compressible files in your home folder, one top folder at a time, largest first. Library, hidden folders
     (.git, .venv, .ollama) and anything open are skipped."""
     t, busy = now(), open_paths()
+    skip_dir = lambda x: x.startswith(".") or x.endswith((".app", ".photoslibrary", ".bundle"))
     for root in comp_roots():
-        out = []
-        for d, dirs, files in os.walk(root):
-            dirs[:] = [x for x in dirs if not x.startswith(".") and not x.endswith((".app", ".photoslibrary", ".bundle"))]
-            for f in files:
-                p = os.path.join(d, f)
-                if f.startswith(".") or f.rsplit(".", 1)[-1].lower() in SKIP_EXT or p in busy: continue
-                try: st = os.lstat(p)
-                except OSError: continue
-                if (st.st_mode & 0o170000) == 0o100000 and st.st_size >= DISK["min_size"] and st.st_nlink == 1 and not st.st_flags & 0x20 \
-                        and t - st.st_mtime > DISK["min_age"] and st.st_uid == ME: out.append((st.st_size, p))
-        for _, p in sorted(out, reverse=True):
-            if compressible(p, os.lstat(p).st_size): yield p
+        out, found = [], spotlight(root)  # the index answers in seconds; walking 11 million files at low priority took hours
+        if found is None:
+            found = []
+            for d, dirs, files in os.walk(root):
+                dirs[:] = [x for x in dirs if not skip_dir(x)]
+                found += [os.path.join(d, f) for f in files]
+        for p in found:
+            f = os.path.basename(p)
+            if any(skip_dir(x) for x in p[len(root):].split("/")[1:-1]): continue
+            if f.startswith(".") or f.rsplit(".", 1)[-1].lower() in SKIP_EXT or p in busy: continue
+            try: st = os.lstat(p)
+            except OSError: continue
+            if (st.st_mode & 0o170000) == 0o100000 and st.st_size >= DISK["min_size"] and st.st_nlink == 1 and not st.st_flags & 0x20 \
+                    and t - st.st_mtime > DISK["min_age"] and st.st_uid == ME: out.append((st.st_size, p))
+        for size, p in sorted(out, reverse=True):
+            if compressible(p, size): yield p
 
 def rewrite(path, compress):
     """Rewrites one file with macOS transparent compression on (or off). Programs read it exactly as before. The copy
@@ -413,7 +424,8 @@ def start_worker(mode):
     try:
         with open(DIR + "/compress.lock", "w") as lk: fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB); fcntl.flock(lk, fcntl.LOCK_UN)
     except OSError: return False  # one started by an earlier monitor is running
-    _worker[0] = subprocess.Popen(["/usr/sbin/taskpolicy", "-b", sys.executable, "-I", os.path.abspath(__file__), mode] + (["--quiet"] if mode == "uncompress" else []),
+    urgent = (disk_free_gb() or 0) < disk_target() / 3  # background priority made no progress at load 50; when it is urgent, run at normal priority
+    _worker[0] = subprocess.Popen((["/usr/sbin/taskpolicy", "-b"] if not urgent else []) + [sys.executable, "-I", os.path.abspath(__file__), mode] + (["--quiet"] if mode == "uncompress" else []),
                      start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     jl(F_EVENTS, dict(t=int(now()), ev="worker", mode=mode))
     return True
