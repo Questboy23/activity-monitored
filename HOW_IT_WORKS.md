@@ -13,6 +13,8 @@ A Mac has a fixed amount of processor time. When more programs ask for it than e
 5. **Undo it.** After the Mac has been calm for three checks (and the slowdown is at least 30 seconds old), the program is restored. A second timer, set at the moment of the slowdown, restores it after 90 seconds no matter what, even if Activity Monitored crashes or is removed. If you switch to a slowed program, it is restored within one check. While the overload continues, the slowdown is renewed each minute.
 6. **Relieve memory.** When macOS reports memory pressure for 2 checks in a row, it pauses (SIGSTOP) the background program with the biggest memory footprint, counting memory macOS compressed or swapped out. A separate timer process resumes it after 2 minutes even if Activity Monitored crashes; the timer is renewed while memory stays short, for at most 10 minutes. After 3 calm checks it resumes one paused program per check, smallest first. Apps with a Dock or menu bar icon, their helpers, system programs and protected work are never paused.
 7. **Stay silent.** Low disk space and exhausted memory are written to `monitored status`. Nothing ever pops up.
+8. **Keep room on the disk.** macOS moves memory onto the disk (swap) when RAM runs out, so a nearly full disk freezes apps. Activity Monitored keeps at least 30 GB free (`monitored disk-target GB` changes it). Below that, it turns on macOS transparent compression for big files in your home folder that have not changed in 3 days. Each file is copied compressed, checked byte for byte against the original, and swapped in only if it is not open, did not change, is not a hard link, is not an iCloud placeholder, and shrank by at least 20%. Library, hidden folders, cloud-synced folders, media, archives and model files are skipped. It never compresses while Time Machine local snapshots exist, because a snapshot would keep the old copy. Every compressed file is listed in `~/.monitored/compressed.jsonl`, and `monitored uncompress` (or 60 GB of free space) reverses it.
+9. **Stop the disk from filling.** Below a third of the target while swap keeps growing, it pauses the program using the most memory. Below 3 GB, it pauses the program writing the most. Each pause has its own 150 s undo timer, ends once half the target is free, and lasts at most 3 hours.
 7. **Hold new work.** `monitored gate -- COMMAND` waits (at most 120 seconds; change with `--max-wait S`) until memory is not thrashing, then starts the command.
 
 ## Protected by default
@@ -26,7 +28,7 @@ What remains are background programs you did not ask for: helper processes stuck
 
 ## What it never does
 
-It never quits or kills a program, deletes or edits your files, sends anything over the network, asks for an admin password, or touches another user's programs.
+It never quits or kills a program, deletes your files or changes what is in them (compression keeps every byte), sends anything over the network, asks for an admin password, or touches another user's programs.
 
 ## Why it is different from current options
 

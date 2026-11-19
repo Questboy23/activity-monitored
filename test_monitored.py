@@ -268,5 +268,22 @@ workers = [e for e in jl(ds + "/events.jsonl") if e.get("ev") == "worker"]
 check("only one compressor at a time while the disk stays short", len(workers) <= 2, len(workers))
 check("disk-target sets the threshold and rejects silly values", "45 GB" in r.stdout and json.load(open(ds + "/settings.json"))["disk_target_gb"] == 45 and r2.returncode == 1, (r.stdout, r2.stdout))
 
+# safety: pid reuse, leftover temp copies, max hold
+dr = tempfile.mkdtemp(); os.environ["MONITORED_DIR"] = dr
+import importlib; importlib.reload(M)
+rp = subprocess.Popen(["/bin/sleep", "300"]); time.sleep(0.3)
+J = {str(rp.pid): dict(act="dpause", name="some_other_program", t=time.time(), ttl=150, since=time.time(), rss=0, timer=None)}
+M.jsave(M.F_JOURNAL, J); fk = dr + "/free"; open(fk, "w").write("1"); os.environ["MONITORED_FAKE_DISK"] = fk
+mo = M.Mon(); mo.disk(time.time() + 100)
+check("a reused pid is never paused again by an old journal entry", "T" not in stat(rp.pid) and str(rp.pid) not in M.journal(), (stat(rp.pid), M.journal()))
+rp.kill()
+lt = os.path.join(dr, ".x.am-tmp"); open(lt, "w").write("partial"); open(dr + "/compress.current", "w").write(lt)
+os.environ["MONITORED_COMPRESS_ROOTS"] = tempfile.mkdtemp(); M.cmd_compress([])
+check("a temporary copy left by a killed worker is removed", not os.path.exists(lt))
+bigf = os.path.join(os.environ["MONITORED_COMPRESS_ROOTS"], "b.txt"); open(bigf, "w").write("abc\n" * 3000000)
+open(fk, "w").write("1.0")
+check("no compressed copy is made when it could fill the disk", M.rewrite(bigf, True) is None and not os.lstat(bigf).st_flags & 0x20)
+for k in ("MONITORED_FAKE_DISK", "MONITORED_COMPRESS_ROOTS"): os.environ.pop(k)
+
 print("\n%d of %d passed" % (sum(results), len(results)))
 sys.exit(0 if all(results) else 1)

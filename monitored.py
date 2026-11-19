@@ -51,7 +51,7 @@ def run(args, t=5):
 def now(): return time.time()
 def jl(path, obj):
     try:
-        if os.path.getsize(path) > 4_000_000: os.replace(path, path + ".1")  # at most two files of 4 MB per log
+        if os.path.getsize(path) > 4_000_000 and not path.endswith("compressed.jsonl"): os.replace(path, path + ".1")  # at most two files of 4 MB per log; the compression record is never rotated, or uncompress would lose files
     except OSError: pass
     with open(path, "a") as f: f.write(json.dumps(obj, separators=(",", ":")) + "\n")
 def jload(path, default):
@@ -241,7 +241,7 @@ def emergency_ok(p, fg_pid, apps):
     """Emergency rule, used only when nothing else can be paused: a script that an app started (Python run by Claude, say)
     may be paused. Never the app itself, its bundled helpers, the monitor, or work protected by name."""
     c, up = p["cmd"], _user_protect()
-    return (eligible(p) and p["pid"] not in (fg_pid, os.getpid(), os.getppid()) and p["pid"] not in apps and not re.search(r"\.app/", re.sub(r"/Python\.app/Contents/MacOS/Python\b", "", c))  # python3 runs from Python.app; it is still a script
+    return (eligible(p) and not SYSTEM_PATH.match(c) and p["pid"] not in (fg_pid, os.getpid(), os.getppid()) and p["pid"] not in apps and not re.search(r"\.app/", re.sub(r"/Python\.app/Contents/MacOS/Python\b", "", c))  # python3 runs from Python.app; it is still a script
             and not APP_PART.search(c) and not NEVER.search(c) and not PRIORITY.search(c) and not (up and up.search(c)))
 
 def pause(p, since=None, act="pause", ttl=None, emg=False):
@@ -275,7 +275,7 @@ def revert_all(why="revert-all"):
 
 
 # ---------- disk relief: frees space without deleting anything, and records every change so it can be reversed ----------
-DISK = dict(pause_below=3.0, min_rate=1e6, swap_grow=0.25, min_mem=500e6, every=float(os.environ.get("MONITORED_DISK_EVERY", "60")), max_paused=2, ttl=150,
+DISK = dict(max_hold=float(os.environ.get("MONITORED_DISK_MAX_HOLD", str(3 * 3600))), pause_below=3.0, min_rate=1e6, swap_grow=0.25, min_mem=500e6, every=float(os.environ.get("MONITORED_DISK_EVERY", "60")), max_paused=2, ttl=150,
             min_size=8e6, min_age=3 * 86400, retry=6 * 3600)
 def disk_target():
     """Free space to keep, in GB: `monitored disk-target GB` (default 30)."""
@@ -305,7 +305,9 @@ def proc_written(pid):
 def comp_roots():
     r = os.environ.get("MONITORED_COMPRESS_ROOTS")
     if r: return r.split(":")  # cloud-synced folders are skipped: a rewritten file could be uploaded again
-    try: return sorted(os.path.join(HOME, d) for d in os.listdir(HOME) if not d.startswith(".") and d not in ("Library", "Applications", "Creative Cloud Files", "Dropbox", "Google Drive", "OneDrive", "Box") and os.path.isdir(os.path.join(HOME, d)))
+    icloud = HOME + "/Library/Mobile Documents/com~apple~CloudDocs/"
+    skip = {"Library", "Applications", "Creative Cloud Files", "Dropbox", "Google Drive", "OneDrive", "Box"} | {d for d in ("Desktop", "Documents") if os.path.exists(icloud + d)}
+    try: return sorted(os.path.join(HOME, d) for d in os.listdir(HOME) if not d.startswith(".") and d not in skip and os.path.isdir(os.path.join(HOME, d)) and not os.path.islink(os.path.join(HOME, d)))
     except OSError: return []
 
 def compressible(path, size):
@@ -313,13 +315,28 @@ def compressible(path, size):
     import zlib
     try:
         with open(path, "rb") as f: f.seek(max(0, size // 2 - (1 << 19))); b = f.read(1 << 20)
-    except OSError: return False
-    return bool(b) and len(zlib.compress(b, 1)) < 0.7 * len(b)
+    except OSError: return None
+    r = len(zlib.compress(b, 1)) / len(b) if b else 1.0
+    return r if r < 0.7 else None
 
 def open_paths():
     """Every file some program has open right now: rewriting one of those could lose that program's writes."""
-    out = run(["/usr/sbin/lsof", "-n", "-w", "-Fn", "-u", str(ME)], 60)
-    return {l[1:] for l in out.splitlines() if l.startswith("n/")}
+    try: r = subprocess.run(["/usr/sbin/lsof", "-n", "-w", "-Fn", "-u", str(ME)], capture_output=True, text=True, errors="replace", timeout=120)
+    except (OSError, subprocess.SubprocessError): return None  # unknown means everything might be open: compress nothing
+    out = {l[1:] for l in r.stdout.splitlines() if l.startswith("n/")}
+    return out or None
+
+def is_open(path):
+    """True unless lsof answers clearly that nothing has the file open; a timeout counts as open."""
+    try: r = subprocess.run(["/usr/sbin/lsof", "-t", "--", path], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError): return True
+    return not (r.returncode == 1 and not r.stdout.strip())
+
+F_CSKIP = DIR + "/compress-skip.json"
+def ok_file(st, t, dev):
+    """Regular, single-link, not compressed, not an iCloud placeholder, on the home disk, yours, idle 3 days, 8 MB or more."""
+    return ((st.st_mode & 0o170000) == 0o100000 and st.st_size >= DISK["min_size"] and st.st_nlink == 1 and not st.st_flags & 0x40000020
+            and st.st_dev == dev and st.st_uid == ME and t - st.st_mtime > DISK["min_age"])
 
 def spotlight(root):
     """Big files under root from the Spotlight index, or None when Spotlight has nothing for it (not indexed, or off)."""
@@ -331,6 +348,8 @@ def candidates():
     """Big, idle, compressible files in your home folder, one top folder at a time, largest first. Library, hidden folders
     (.git, .venv, .ollama) and anything open are skipped."""
     t, busy = now(), open_paths()
+    if busy is None: return
+    dev, rejected = os.lstat(HOME).st_dev, jload(F_CSKIP, {})
     skip_dir = lambda x: x.startswith(".") or x.endswith((".app", ".photoslibrary", ".bundle"))
     for root in comp_roots():
         out, found = [], spotlight(root)  # the index answers in seconds; walking 11 million files at low priority took hours
@@ -345,30 +364,38 @@ def candidates():
             if f.startswith(".") or f.rsplit(".", 1)[-1].lower() in SKIP_EXT or p in busy: continue
             try: st = os.lstat(p)
             except OSError: continue
-            if (st.st_mode & 0o170000) == 0o100000 and st.st_size >= DISK["min_size"] and st.st_nlink == 1 and not st.st_flags & 0x20 \
-                    and t - st.st_mtime > DISK["min_age"] and st.st_uid == ME: out.append((st.st_size, p))
+            if ok_file(st, t, dev) and rejected.get(p) != [st.st_mtime, st.st_size]: out.append((st.st_size, p))
         for size, p in sorted(out, reverse=True):
-            if compressible(p, size): yield p
+            r = compressible(p, size)
+            if r: yield p, r
 
-def rewrite(path, compress):
+def rewrite(path, compress, ratio=1.0):
     """Rewrites one file with macOS transparent compression on (or off). Programs read it exactly as before. The copy
     is checked byte for byte, and the file is left alone if it changed, is open, or would not shrink."""
-    st = os.lstat(path)
-    tmp = os.path.join(os.path.dirname(path), ".%s.am-tmp" % os.path.basename(path))
+    tmp = None
     try:
+        st = os.lstat(path)
+        if (st.st_mode & 0o170000) != 0o100000 or st.st_nlink != 1: return None
+        need = st.st_size * (min(1.0, ratio * 1.5) if compress else 1.0) + 2e9  # the temporary copy must never fill the disk
+        if (disk_free_gb() or 0) * 1e9 < need: return None
+        tmp = os.path.join(os.path.dirname(path), ".%s.am-tmp" % os.path.basename(path))
+        if os.path.lexists(tmp): return None
+        with open(DIR + "/compress.current", "w") as f: f.write(tmp)  # a killed worker's copy is removed by the next one
         r = subprocess.run(["/usr/bin/ditto", "--hfsCompression", path, tmp] if compress else ["/bin/cp", "-p", path, tmp], capture_output=True, timeout=900)  # ditto --nohfsCompression keeps it compressed; cp -p writes it out plain
         if r.returncode != 0: return None
         after = os.lstat(tmp).st_blocks * 512
         if compress and after > 0.8 * st.st_blocks * 512: return None
         if subprocess.run(["/usr/bin/cmp", "-s", path, tmp]).returncode != 0: return None
-        if run(["/usr/sbin/lsof", "-t", "--", path], 20).strip(): return None
+        if is_open(path): return None
         now_st = os.lstat(path)
-        if (now_st.st_mtime, now_st.st_size, now_st.st_ino) != (st.st_mtime, st.st_size, st.st_ino): return None
+        if (now_st.st_mtime, now_st.st_size, now_st.st_ino, now_st.st_nlink) != (st.st_mtime, st.st_size, st.st_ino, 1): return None
         os.replace(tmp, path); tmp = None
         return st.st_blocks * 512, after
     except (OSError, subprocess.SubprocessError): return None
     finally:
-        if tmp and os.path.exists(tmp): os.remove(tmp)  # our own temporary copy, never the original
+        try:
+            if tmp and os.path.isfile(tmp) and not os.path.islink(tmp): os.remove(tmp)  # our own temporary copy, never the original
+        except OSError: pass
 
 def comp_log():
     out = {}
@@ -387,12 +414,24 @@ def cmd_compress(args):
     try: fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError: return
     saved = n = 0
-    for p in candidates():
+    try:
+        left = open(DIR + "/compress.current").read().strip()
+        if left.endswith(".am-tmp") and os.path.basename(left).startswith("."): os.remove(left)
+    except OSError: pass
+    if "com.apple.TimeMachine." in run(["/usr/bin/tmutil", "listlocalsnapshots", "/System/Volumes/Data"], 30):
+        # a local snapshot keeps the old copy of every rewritten file, so compressing would use space; macOS deletes these snapshots itself when space runs low
+        jsave(F_CSTATE, dict(exhausted=now() - DISK["retry"] + 1800)); return jl(F_EVENTS, dict(t=int(now()), ev="compressed", files=0, saved=0, why="snapshots"))
+    if open_paths() is None:  # lsof failed (very busy Mac): try again in 10 minutes
+        jsave(F_CSTATE, dict(exhausted=now() - DISK["retry"] + 600)); return
+    rejected = jload(F_CSKIP, {})
+    for p, ratio in candidates():
         gb = disk_free_gb()
         if gb is None or gb >= disk_target() + 5: break
-        if gb < 0.3: break  # the temporary copy needs a little room
-        r = rewrite(p, True)
-        if r: n += 1; saved += r[0] - r[1]; jl(F_COMP, dict(t=int(now()), ev="compress", path=p, before=r[0], after=r[1], mtime=os.lstat(p).st_mtime))
+        r = rewrite(p, True, ratio)
+        try: st = os.lstat(p)
+        except OSError: continue
+        if r: n += 1; saved += r[0] - r[1]; jl(F_COMP, dict(t=int(now()), ev="compress", path=p, before=r[0], after=r[1], mtime=st.st_mtime))
+        elif not st.st_flags & 0x20: rejected[p] = [st.st_mtime, st.st_size]; jsave(F_CSKIP, rejected)  # do not copy it again unless it changes
     else:
         jsave(F_CSTATE, dict(exhausted=now()))  # nothing left to compress: do not walk the disk again for 6 hours
     jl(F_EVENTS, dict(t=int(now()), ev="compressed", files=n, saved=saved))
@@ -404,6 +443,10 @@ def cmd_restore(args):
     try: fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError: return print("compressor is busy; try again in a minute")
     n = left = 0
+    try:
+        tl = open(DIR + "/compress.current").read().strip()
+        if tl.endswith(".am-tmp") and os.path.basename(tl).startswith("."): os.remove(tl)
+    except OSError: pass
     for p, e in comp_log().items():
         try: st = os.lstat(p)
         except OSError: jl(F_COMP, dict(t=int(now()), ev="restore", path=p, gone=True)); continue
@@ -412,6 +455,7 @@ def cmd_restore(args):
         if gb - (e["before"] - e["after"]) / 1e9 < disk_target() + 20: left += 1; continue
         if rewrite(p, False): n += 1; jl(F_COMP, dict(t=int(now()), ev="restore", path=p))
         else: left += 1
+    if left and not n: jsave(F_CSTATE, dict(jload(F_CSTATE, {}), restore_blocked=now()))
     if "--quiet" not in args: print("restored %d files; %d still compressed (they stay compressed until the disk target + 20 GB would remain free)" % (n, left))
 
 _worker = [None]
@@ -436,7 +480,7 @@ class Mon:
         self.last_fg, self.t_prev, self.c_prev = None, now(), sum(os.times()[:4])
         self.sleep, self.batt, self.tk0, self.fg_t = CFG["tick"], (0.0, False), None, 0.0
         self.mhot = self.mcalm = 0
-        self.severe, self.fg_pid, self.disk_t, self.dw, self.swap_prev = False, None, 0.0, {}, None
+        self.severe, self.fg_pid, self.disk_t, self.dw, self.swap_prev, self.held = False, None, 0.0, {}, None, {}
 
     def disk(self, t, procs=None, fg_pid=None):
         """Keeps free disk at or above the target (30 GB unless set with `monitored disk-target GB`), once a minute.
@@ -449,8 +493,9 @@ class Mon:
         T, cs = disk_target(), jload(F_CSTATE, {})
         safe = not TEST_ONLY or os.environ.get("MONITORED_COMPRESS_ROOTS")  # tests never compress real folders
         if safe and gb < T and t - cs.get("exhausted", 0) > DISK["retry"]: start_worker("compress")
-        elif safe and gb >= T + 30 and comp_log(): start_worker("uncompress")
+        elif safe and gb >= T + 30 and t - cs.get("restore_blocked", 0) > DISK["retry"] and comp_log(): start_worker("uncompress")
         dp = {k: e for k, e in journal().items() if e["act"] == "dpause"}
+        self.held = {k: v for k, v in self.held.items() if t - v < 3600}  # released after max-hold: not paused again for an hour
         sw = swap_used_gb()
         grew, self.swap_prev = (sw is not None and self.swap_prev is not None and sw - self.swap_prev >= DISK["swap_grow"]), sw
         if gb >= T / 2:
@@ -459,7 +504,10 @@ class Mon:
         procs = procs or sample()
         if not procs: return
         for k, e in dp.items():  # still short: renew the pause (the OS timer resumes it if this monitor dies)
-            if int(k) in procs: pause(procs[int(k)], since=e["since"], act="dpause", ttl=DISK["ttl"])
+            q = procs.get(int(k))
+            if not q or pname(q["cmd"]) != e["name"]: undo(int(k), "gone")  # exited; its pid may now belong to another program
+            elif t - e["since"] >= DISK["max_hold"]: undo(int(k), "max-hold"); self.held[int(k)] = t  # never hold anything for days
+            else: pause(q, since=e["since"], act="dpause", ttl=DISK["ttl"])
         w = {pid: proc_written(pid) for pid, p in procs.items() if p["uid"] == ME}
         prev, self.dw = self.dw, {k: v for k, v in w.items() if v is not None}
         if len(dp) >= DISK["max_paused"] or not (gb < DISK["pause_below"] or (gb < T / 3 and grew)): return
@@ -467,14 +515,14 @@ class Mon:
         if fg_pid is None: return
         apps = gui_pids()
         if gb < DISK["pause_below"]:
-            c = [((self.dw[k] - prev[k]) / max(dt, 1e-3), procs[k]) for k in self.dw if k in prev and str(k) not in dp and emergency_ok(procs[k], fg_pid, apps)]
+            c = [((self.dw[k] - prev[k]) / max(dt, 1e-3), procs[k]) for k in self.dw if k in prev and str(k) not in dp and k not in self.held and emergency_ok(procs[k], fg_pid, apps)]
             c = [x for x in c if x[0] >= DISK["min_rate"]]  # bytes per second written since the last check
             if c:
                 d, p = max(c, key=lambda x: x[0])
                 return pause(dict(p, rss=footprint(p["pid"])), act="dpause", ttl=DISK["ttl"])
         if gb < T / 3 and grew:  # swap files live on this disk: a growing one eats the room compression made (Nov 19: 24 GB run_bench.py)
             protected, _ = classify(procs, fg_pid)
-            c = [(footprint(k), p) for k, p in procs.items() if str(k) not in dp and (pausable(p, protected, apps) or emergency_ok(p, fg_pid, apps))]
+            c = [(footprint(k), p) for k, p in procs.items() if str(k) not in dp and k not in self.held and not SYSTEM_PATH.match(p["cmd"]) and (pausable(p, protected, apps) or emergency_ok(p, fg_pid, apps))]
             c = [x for x in c if x[0] >= DISK["min_mem"]]
             if c:
                 f, p = max(c, key=lambda x: x[0])
@@ -510,6 +558,7 @@ class Mon:
         self.mhot, self.mcalm = (self.mhot + 1, 0) if mem_hot else (0, self.mcalm + 1)
         paused = {k: e for k, e in journal().items() if e["act"] == "pause"}
         for k, e in paused.items():
+            if int(k) in procs and pname(procs[int(k)]["cmd"]) != e["name"]: undo(int(k), "gone"); continue  # pid reused by another program
             if int(k) in procs and mem_hot and t - e["t"] >= 60:
                 if t - e["since"] < MEM["max_hold"]: pause(procs[int(k)], since=e["since"], emg=e.get("emg", False))
                 else: undo(int(k), "max-hold")  # never keep anything frozen for long
