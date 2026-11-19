@@ -229,5 +229,19 @@ check("emergency rule never pauses the app, its helpers, claude or the front app
       not any(M.emergency_ok(P(91002, c), 91000, set()) for c in ("/Applications/Claude.app/Contents/MacOS/Claude", "/Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/x",
               "/Users/x/claude-code/claude", "pytest -q")) and not M.emergency_ok(P(91000, "python x.py"), 91000, set()))
 
+# emergency end to end: the only big program is protected (as scripts under Claude are), memory is short and swap full
+EM = "monitored_test_emg"
+eh = subprocess.Popen(["/usr/bin/python3", "-c", "b=bytearray(300*1024*1024)\nfor i in range(0,len(b),4096): b[i]=1\nimport time\nwhile True: time.sleep(1)", EM], start_new_session=True); time.sleep(3)
+os.environ["MONITORED_TEST_ONLY"] = EM; M.TEST_ONLY = EM
+mo = M.Mon(); mo.severe, mo.fg_pid = True, 1
+pr = M.sample(); prot = {eh.pid}
+for _ in range(3): mo.relieve(pr, prot, True, time.time())
+s_e = stat(eh.pid); M.revert_all("test"); s_after = stat(eh.pid); eh.kill()
+check("memory emergency pauses a protected script, and undo resumes it", "T" in s_e and "T" not in s_after, (s_e, s_after))
+mo2 = M.Mon(); mo2.severe = False; eh2 = subprocess.Popen(["/usr/bin/python3", "-c", "b=bytearray(300*1024*1024)\nfor i in range(0,len(b),4096): b[i]=1\nimport time\nwhile True: time.sleep(1)", EM], start_new_session=True); time.sleep(3)
+for _ in range(3): mo2.relieve(M.sample(), {eh2.pid}, True, time.time())
+check("without a swap emergency a protected script is left alone", "T" not in stat(eh2.pid), stat(eh2.pid)); M.revert_all("test"); eh2.kill()
+os.environ["MONITORED_TEST_ONLY"] = "monitored_test_"
+
 print("\n%d of %d passed" % (sum(results), len(results)))
 sys.exit(0 if all(results) else 1)
