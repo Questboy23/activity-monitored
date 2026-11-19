@@ -11,7 +11,8 @@ compressed.jsonl, reversible), and below 3 GB it pauses the program writing most
   monitored battery on|off    battery saver: checks less often while on battery
   monitored protect NAME      never touch programs whose command contains NAME
   monitored gate [--max-wait S] -- CMD   start CMD once memory is not thrashing (waits at most S seconds)
-  monitored uncompress        undo the space-saving compression (it also runs by itself once 60 GB are free)
+  monitored disk-target GB    free space to keep (default 30 GB); below it, it compresses idle files and stops swap growth
+  monitored uncompress        undo the space-saving compression (it also runs by itself at target + 30 GB free)
   monitored uninstall [--purge] | version
 """
 import ctypes, json, os, re, shutil, signal, subprocess, sys, time
@@ -176,7 +177,7 @@ def journal(): return jload(F_JOURNAL, {})
 DRY, _would = False, {}
 
 # Warnings: things slowing a process cannot fix (full disk, memory exhausted). It tells you; it never kills or deletes.
-WARN = dict(disk_min_gb=float(os.environ.get("MONITORED_DISK_MIN_GB", "20")), swap_full=0.9, mem_ticks=10, every=1800)
+WARN = dict(swap_full=0.9, mem_ticks=10, every=1800)
 _warned, _wstate = {}, dict(disk_t=0.0, mem=0)
 def disk_free_gb():
     fake = os.environ.get("MONITORED_FAKE_DISK")  # tests: a file holding the free GB to report
@@ -194,8 +195,8 @@ def warn_check(lvl, swap, mem_hot):
     t = now()
     if t - _wstate["disk_t"] >= 60:
         _wstate["disk_t"] = t; gb = disk_free_gb()
-        if gb is not None and gb < WARN["disk_min_gb"]:
-            notify("disk", "Disk nearly full: %.0f GB free. macOS needs free space for swap; below ~20 GB apps can freeze. Compressing big idle files to make room." % gb)
+        if gb is not None and gb < disk_target():
+            notify("disk", "Disk below the %.0f GB target: %.0f GB free. macOS needs free space for swap. Compressing big idle files to make room." % (disk_target(), gb))
     _wstate["mem"] = _wstate["mem"] + 1 if (mem_hot or (lvl is not None and lvl >= 2 and swap >= WARN["swap_full"])) else 0
     if _wstate["mem"] >= WARN["mem_ticks"] and t - _warned.get("memory", 0) >= WARN["every"]:  # check the limit first: ps is costly while memory is short
         top = sorted(sample().values(), key=lambda p: -p["rss"])[:3]
@@ -274,9 +275,23 @@ def revert_all(why="revert-all"):
 
 
 # ---------- disk relief: frees space without deleting anything, and records every change so it can be reversed ----------
-DISK = dict(compress_below=float(os.environ.get("MONITORED_COMPRESS_BELOW_GB", "20")), compress_until=25.0, restore_above=60.0, restore_keep=50.0,
-            pause_below=3.0, resume_above=6.0, min_rate=1e6, every=float(os.environ.get("MONITORED_DISK_EVERY", "60")), max_paused=2, ttl=150,
+DISK = dict(pause_below=3.0, min_rate=1e6, swap_grow=0.25, min_mem=500e6, every=float(os.environ.get("MONITORED_DISK_EVERY", "60")), max_paused=2, ttl=150,
             min_size=8e6, min_age=3 * 86400, retry=6 * 3600)
+def disk_target():
+    """Free space to keep, in GB: `monitored disk-target GB` (default 30)."""
+    for k in ("MONITORED_DISK_TARGET", "MONITORED_DISK_MIN_GB"):  # tests
+        if os.environ.get(k): return float(os.environ[k])
+    try: return float(settings().get("disk_target_gb", 30))
+    except (TypeError, ValueError): return 30.0
+
+def swap_used_gb():
+    fake = os.environ.get("MONITORED_FAKE_SWAP")  # tests: a file holding the used GB to report
+    if fake:
+        try: return float(open(fake).read())
+        except (OSError, ValueError): return None
+    m = re.findall(r"used = ([\d.]+)M", run(["/usr/sbin/sysctl", "-n", "vm.swapusage"]))
+    return float(m[0]) / 1024 if m else None
+
 F_COMP, F_CSTATE = DIR + "/compressed.jsonl", DIR + "/compress-state.json"
 SKIP_EXT = set("zip gz tgz xz bz2 zst lz4 7z rar dmg iso pkg sparseimage sparsebundle jpg jpeg png heic gif webp avif mp4 mov m4v mkv avi webm mp3 m4a aac flac ogg opus "
                "gguf safetensors pt pth onnx bin ckpt npz parquet sqlite db sqlite3 wal shm lock pack idx".split())
@@ -363,7 +378,7 @@ def cmd_compress(args):
     saved = n = 0
     for p in candidates():
         gb = disk_free_gb()
-        if gb is None or gb >= DISK["compress_until"]: break
+        if gb is None or gb >= disk_target() + 5: break
         if gb < 0.3: break  # the temporary copy needs a little room
         r = rewrite(p, True)
         if r: n += 1; saved += r[0] - r[1]; jl(F_COMP, dict(t=int(now()), ev="compress", path=p, before=r[0], after=r[1], mtime=os.lstat(p).st_mtime))
@@ -383,17 +398,22 @@ def cmd_restore(args):
         except OSError: jl(F_COMP, dict(t=int(now()), ev="restore", path=p, gone=True)); continue
         if not st.st_flags & 0x20: jl(F_COMP, dict(t=int(now()), ev="restore", path=p, already=True)); continue  # rewritten since by its program
         gb = disk_free_gb() or 0
-        if gb - (e["before"] - e["after"]) / 1e9 < DISK["restore_keep"]: left += 1; continue
+        if gb - (e["before"] - e["after"]) / 1e9 < disk_target() + 20: left += 1; continue
         if rewrite(p, False): n += 1; jl(F_COMP, dict(t=int(now()), ev="restore", path=p))
         else: left += 1
-    if "--quiet" not in args: print("restored %d files; %d still compressed (they stay compressed until 50 GB would remain free)" % (n, left))
+    if "--quiet" not in args: print("restored %d files; %d still compressed (they stay compressed until the disk target + 20 GB would remain free)" % (n, left))
 
+_worker = [None]
 def start_worker(mode):
+    """One worker at a time. The lock alone is not enough: at load average 300 a new worker took minutes to reach its
+    lock, and a test monitor checking every 2 s started 268 of them."""
     import fcntl
+    w = _worker[0]
+    if w is not None and w.poll() is None: return False  # the one we started is still running (or still starting)
     try:
         with open(DIR + "/compress.lock", "w") as lk: fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB); fcntl.flock(lk, fcntl.LOCK_UN)
-    except OSError: return False  # already running
-    subprocess.Popen(["/usr/sbin/taskpolicy", "-b", sys.executable, "-I", os.path.abspath(__file__), mode] + (["--quiet"] if mode == "uncompress" else []),
+    except OSError: return False  # one started by an earlier monitor is running
+    _worker[0] = subprocess.Popen(["/usr/sbin/taskpolicy", "-b", sys.executable, "-I", os.path.abspath(__file__), mode] + (["--quiet"] if mode == "uncompress" else []),
                      start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     jl(F_EVENTS, dict(t=int(now()), ev="worker", mode=mode))
     return True
@@ -404,37 +424,49 @@ class Mon:
         self.last_fg, self.t_prev, self.c_prev = None, now(), sum(os.times()[:4])
         self.sleep, self.batt, self.tk0, self.fg_t = CFG["tick"], (0.0, False), None, 0.0
         self.mhot = self.mcalm = 0
-        self.severe, self.fg_pid, self.disk_t, self.dw = False, None, 0.0, {}
+        self.severe, self.fg_pid, self.disk_t, self.dw, self.swap_prev = False, None, 0.0, {}, None
 
     def disk(self, t, procs=None, fg_pid=None):
-        """Once a minute. Below 20 GB free: start the compressor. Below 3 GB: pause the program writing most to disk,
-        and resume it once 6 GB are free. Above 60 GB: undo compression while 50 GB stay free."""
+        """Keeps free disk at or above the target (30 GB unless set with `monitored disk-target GB`), once a minute.
+        Below the target: compress big idle files until target + 5 GB. Below a third of it while swap keeps growing:
+        pause the program using the most memory. Below 3 GB: pause the program writing most to disk. Paused programs
+        resume once half the target is free. Above target + 30 GB: undo compression while target + 20 GB stay free."""
         if t - self.disk_t < DISK["every"]: return
         dt, self.disk_t, gb = t - self.disk_t, t, disk_free_gb()
         if gb is None or DRY: return
-        cs = jload(F_CSTATE, {})
+        T, cs = disk_target(), jload(F_CSTATE, {})
         safe = not TEST_ONLY or os.environ.get("MONITORED_COMPRESS_ROOTS")  # tests never compress real folders
-        if safe and gb < DISK["compress_below"] and t - cs.get("exhausted", 0) > DISK["retry"]: start_worker("compress")
-        elif safe and gb >= DISK["restore_above"] and comp_log(): start_worker("uncompress")
+        if safe and gb < T and t - cs.get("exhausted", 0) > DISK["retry"]: start_worker("compress")
+        elif safe and gb >= T + 30 and comp_log(): start_worker("uncompress")
         dp = {k: e for k, e in journal().items() if e["act"] == "dpause"}
-        if gb >= DISK["resume_above"]:
+        sw = swap_used_gb()
+        grew, self.swap_prev = (sw is not None and self.swap_prev is not None and sw - self.swap_prev >= DISK["swap_grow"]), sw
+        if gb >= T / 2:
             for k in dp: undo(int(k), "disk-ok")
             self.dw = {}; return
         procs = procs or sample()
         if not procs: return
         for k, e in dp.items():  # still short: renew the pause (the OS timer resumes it if this monitor dies)
-            if int(k) in procs and gb < DISK["resume_above"]: pause(procs[int(k)], since=e["since"], act="dpause", ttl=DISK["ttl"])
+            if int(k) in procs: pause(procs[int(k)], since=e["since"], act="dpause", ttl=DISK["ttl"])
         w = {pid: proc_written(pid) for pid, p in procs.items() if p["uid"] == ME}
         prev, self.dw = self.dw, {k: v for k, v in w.items() if v is not None}
-        if gb >= DISK["pause_below"] or len(dp) >= DISK["max_paused"]: return
+        if len(dp) >= DISK["max_paused"] or not (gb < DISK["pause_below"] or (gb < T / 3 and grew)): return
         if fg_pid is None: fg_pid = foreground(procs)[0]
         if fg_pid is None: return
         apps = gui_pids()
-        c = [((self.dw[k] - prev[k]) / max(dt, 1e-3), procs[k]) for k in self.dw if k in prev and str(k) not in dp and emergency_ok(procs[k], fg_pid, apps)]
-        c = [x for x in c if x[0] >= DISK["min_rate"]]  # bytes per second written since the last check
-        if c:
-            d, p = max(c, key=lambda x: x[0])
-            pause(dict(p, rss=footprint(p["pid"])), act="dpause", ttl=DISK["ttl"])
+        if gb < DISK["pause_below"]:
+            c = [((self.dw[k] - prev[k]) / max(dt, 1e-3), procs[k]) for k in self.dw if k in prev and str(k) not in dp and emergency_ok(procs[k], fg_pid, apps)]
+            c = [x for x in c if x[0] >= DISK["min_rate"]]  # bytes per second written since the last check
+            if c:
+                d, p = max(c, key=lambda x: x[0])
+                return pause(dict(p, rss=footprint(p["pid"])), act="dpause", ttl=DISK["ttl"])
+        if gb < T / 3 and grew:  # swap files live on this disk: a growing one eats the room compression made (Nov 19: 24 GB run_bench.py)
+            protected, _ = classify(procs, fg_pid)
+            c = [(footprint(k), p) for k, p in procs.items() if str(k) not in dp and (pausable(p, protected, apps) or emergency_ok(p, fg_pid, apps))]
+            c = [x for x in c if x[0] >= DISK["min_mem"]]
+            if c:
+                f, p = max(c, key=lambda x: x[0])
+                pause(dict(p, rss=f), act="dpause", ttl=DISK["ttl"])
 
     def on_battery(self):  # checked at most once a minute
         if now() - self.batt[0] > 60: self.batt = (now(), "Battery Power" in run(["/usr/bin/pmset", "-g", "batt"]))
@@ -604,7 +636,7 @@ LABEL = os.environ.get("MONITORED_LABEL", "com.activitymonitored.agent")
 PLIST = os.path.join(HOME, "Library", "LaunchAgents", LABEL + ".plist")
 F_SET = DIR + "/settings.json"
 SELF = os.path.abspath(__file__)
-DEFAULTS = {"mode": "on", "battery_saver": True}
+DEFAULTS = {"mode": "on", "battery_saver": True, "disk_target_gb": 30}
 
 def settings():
     s = dict(DEFAULTS); s.update(jload(F_SET, {})); return s
@@ -684,6 +716,11 @@ def cmd_toggle(key, args):
     if args[:1] not in (["on"], ["off"]): print("usage: monitored battery on|off"); return 1
     return set_key(key, args[0] == "on")
 
+def cmd_disk_target(args):
+    try: v = float(args[0]); assert 5 <= v <= 500
+    except (IndexError, ValueError, AssertionError): print("usage: monitored disk-target GB  (5 to 500; now %.0f)" % disk_target()); return 1
+    s = settings(); s["disk_target_gb"] = v; jsave(F_SET, s); print("Activity Monitored keeps at least %.0f GB free." % v)
+
 def cmd_protect(args):
     if not args: print("usage: monitored protect NAME"); return 1
     with open(DIR + "/protect.txt", "a") as f: f.write(" ".join(args) + "\n")
@@ -709,7 +746,7 @@ def cmd_status(args):
         if e.get("ev") in ("demote", "would_demote", "pause", "would_pause", "dpause", "would_dpause"): names[e.get("name", "?")] += 1
     print("Last 24 hours: %d slowdowns or pauses%s." % (sum(names.values()), (", most often " + ", ".join("%s (%d)" % kv for kv in sorted(names.items(), key=lambda kv: -kv[1])[:3])) if names else ""))
     gb = disk_free_gb()
-    if gb is not None: print("Disk free: %.0f GB%s." % (gb, " (too low: below %d GB apps can freeze)" % WARN["disk_min_gb"] if gb < WARN["disk_min_gb"] else ""))
+    if gb is not None: print("Disk free: %.0f GB (target %.0f GB%s)." % (gb, disk_target(), "; below it, making room" if gb < disk_target() else ""))
     cl = comp_log()
     if cl: print("Compressed to free space: %d files, %.1f GB saved. Nothing was deleted; files open exactly as before. Undo: monitored uncompress (runs by itself above 60 GB free)."
                  % (len(cl), sum(e["before"] - e["after"] for e in cl.values()) / 1e9))
@@ -722,6 +759,7 @@ if __name__ == "__main__":
     table = {"run": cmd_run, "gate": cmd_gate, "revert-all": lambda x: revert_all(), "status": cmd_status, "install": cmd_install,
              "uninstall": cmd_uninstall, "protect": cmd_protect, "on": lambda x: set_key("mode", "on"), "watch": lambda x: set_key("mode", "watch"),
              "off": lambda x: set_key("mode", "off"), "battery": lambda x: cmd_toggle("battery_saver", x),
+             "disk-target": cmd_disk_target,
              "version": lambda x: print(__version__), "status-json": status_json,
              "compress": cmd_compress, "uncompress": cmd_restore}
     if c not in table:

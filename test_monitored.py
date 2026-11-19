@@ -118,7 +118,7 @@ sh(sys.executable, SM, "run", "--ticks", "3", "--tick", "0.5", env=env, t=60)
 w = [e for e in jl(dw + "/events.jsonl") if e.get("ev") == "warn"]
 check("low disk produces exactly one rate-limited warning", len(w) == 1 and w[0]["kind"] == "disk" and "GB free" in w[0]["msg"], w)
 r = sh(sys.executable, SM, "status", env=env)
-check("status reports disk free and the warning", "Disk free:" in r.stdout and "ago): Disk nearly full" in r.stdout, r.stdout[-200:])
+check("status reports disk free and the warning", "Disk free:" in r.stdout and "ago): Disk below the" in r.stdout, r.stdout[-200:])
 dw2 = tempfile.mkdtemp(); sh(sys.executable, SM, "run", "--ticks", "3", "--tick", "0.5", env={"MONITORED_DIR": dw2, "MONITORED_DISK_MIN_GB": "0", "MONITORED_NO_NOTIFY": "1"}, t=60)
 check("enough disk produces no disk warning", not [e for e in jl(dw2 + "/events.jsonl") if e.get("kind") == "disk"])
 
@@ -204,7 +204,7 @@ check("uncompress restores the file exactly", not os.lstat(big).st_flags & 0x20 
 dd = tempfile.mkdtemp(); fake2 = dd + "/free"; open(fake2, "w").write("1")
 WM = "monitored_test_writer"
 wr = subprocess.Popen(["/bin/sh", "-c", "exec /usr/bin/python3 -c \"import os,sys\nwhile True:\n f=open(sys.argv[1],'wb'); f.write(os.urandom(4000000)); f.flush(); os.fsync(f.fileno()); f.close()\" %s/w.bin %s" % (dd, WM)], start_new_session=True)
-env2 = {"MONITORED_DIR": dd, "MONITORED_FAKE_DISK": fake2, "MONITORED_DISK_EVERY": "2", "MONITORED_COMPRESS_ROOTS": dd}
+env2 = {"MONITORED_DIR": dd, "MONITORED_FAKE_DISK": fake2, "MONITORED_DISK_EVERY": "2", "MONITORED_COMPRESS_ROOTS": dd, "MONITORED_DISK_TARGET": "10"}
 mon = subprocess.Popen([sys.executable, SM, "run", "--tick", "1"], env=dict(os.environ, **env2))
 s_paused = ""
 for _ in range(20):
@@ -216,7 +216,7 @@ s_res = s_paused
 for _ in range(15):
     time.sleep(1); s_res = stat(wr.pid)
     if "T" not in s_res: break
-check("it resumes once 6 GB are free", "T" not in s_res, s_res)
+check("it resumes once half the target (5 of 10 GB) is free", "T" not in s_res, s_res)
 ev = [e["ev"] for e in jl(dd + "/events.jsonl")]
 check("disk pause and resume are recorded", "dpause" in ev and "undo_dpause" in ev, ev[-6:])
 mon.terminate(); mon.wait(); wr.kill()
@@ -242,6 +242,31 @@ mo2 = M.Mon(); mo2.severe = False; eh2 = subprocess.Popen(["/usr/bin/python3", "
 for _ in range(3): mo2.relieve(M.sample(), {eh2.pid}, True, time.time())
 check("without a swap emergency a protected script is left alone", "T" not in stat(eh2.pid), stat(eh2.pid)); M.revert_all("test"); eh2.kill()
 os.environ["MONITORED_TEST_ONLY"] = "monitored_test_"
+
+# threshold: below a third of the target while swap keeps growing, pause the biggest memory user; resume at half the target
+ds = tempfile.mkdtemp(); fd_, fs_ = ds + "/free", ds + "/swap"; open(fd_, "w").write("8"); open(fs_, "w").write("1")
+SM2 = "monitored_test_swap"
+sh_ = subprocess.Popen(["/usr/bin/python3", "-c", "b=bytearray(600*1024*1024)\nfor i in range(0,len(b),4096): b[i]=1\nimport time\nwhile True: time.sleep(1)", SM2], start_new_session=True); time.sleep(3)
+env3 = {"MONITORED_DIR": ds, "MONITORED_FAKE_DISK": fd_, "MONITORED_FAKE_SWAP": fs_, "MONITORED_DISK_EVERY": "2", "MONITORED_COMPRESS_ROOTS": ds, "MONITORED_DISK_TARGET": "30", "MONITORED_TEST_ONLY": SM2}
+mon3 = subprocess.Popen([sys.executable, SM, "run", "--tick", "1"], env=dict(os.environ, **env3))
+time.sleep(3); st3 = ""
+for i in range(15):
+    time.sleep(1); open(fs_, "w").write(str(2 + i)); st3 = stat(sh_.pid)
+    if "T" in st3: break
+check("disk under a third of the target and swap growing: biggest memory user paused", "T" in st3, st3)
+open(fd_, "w").write("16"); open(fs_, "w").write("100"); st4 = st3
+for _ in range(15):
+    time.sleep(1); st4 = stat(sh_.pid)
+    if "T" not in st4: break
+check("it resumes once half the target is free", "T" not in st4, st4)
+open(fd_, "w").write("8")  # swap stays at 100: not growing
+for _ in range(6): time.sleep(1)
+check("swap not growing: nothing paused even below a third of the target", "T" not in stat(sh_.pid), stat(sh_.pid))
+mon3.terminate(); mon3.wait(); sh_.kill()
+r = sh(sys.executable, SM, "disk-target", "45", env={"MONITORED_DIR": ds}); r2 = sh(sys.executable, SM, "disk-target", "2", env={"MONITORED_DIR": ds})
+workers = [e for e in jl(ds + "/events.jsonl") if e.get("ev") == "worker"]
+check("only one compressor at a time while the disk stays short", len(workers) <= 2, len(workers))
+check("disk-target sets the threshold and rejects silly values", "45 GB" in r.stdout and json.load(open(ds + "/settings.json"))["disk_target_gb"] == 45 and r2.returncode == 1, (r.stdout, r2.stdout))
 
 print("\n%d of %d passed" % (sum(results), len(results)))
 sys.exit(0 if all(results) else 1)
