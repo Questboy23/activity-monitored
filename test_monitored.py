@@ -172,5 +172,62 @@ if mp: os.kill(int(mp[0]), 18)
 check("no pop-up code left", "osascript" not in open(SM).read())
 subprocess.run(["pkill", "-f", MM])
 
+# disk relief: compression frees space, deletes nothing, keeps every byte, and is reversible
+import hashlib
+def sha(p): return hashlib.sha256(open(p, "rb").read()).hexdigest()
+dk = tempfile.mkdtemp(); root = tempfile.mkdtemp(); fake = dk + "/free"; open(fake, "w").write("10")
+old = time.time() - 10 * 86400
+big = os.path.join(root, "sub", "corpus.txt"); os.makedirs(os.path.dirname(big))
+open(big, "w").write("".join("line %d of a very repetitive log file\n" % i for i in range(600000))); os.utime(big, (old, old))
+new_f = os.path.join(root, "fresh.txt"); open(new_f, "w").write("x" * 20000000)  # modified just now: must be left alone
+opened = os.path.join(root, "open.txt"); open(opened, "w").write("y" * 20000000); os.utime(opened, (old, old))
+zipf = os.path.join(root, "a.zip"); open(zipf, "w").write("z" * 20000000); os.utime(zipf, (old, old))
+holder = subprocess.Popen(["/usr/bin/tail", "-f", opened], stdout=subprocess.DEVNULL); time.sleep(0.5)
+h0, du0, m0 = sha(big), os.lstat(big).st_blocks, os.lstat(big).st_mtime
+env = {"MONITORED_DIR": dk, "MONITORED_COMPRESS_ROOTS": root, "MONITORED_FAKE_DISK": fake}
+sh(sys.executable, SM, "compress", env=env, t=300)
+st = os.lstat(big); holder.kill()
+check("compression shrinks a big idle file, same bytes and date", sha(big) == h0 and st.st_mtime == m0 and st.st_flags & 0x20 and st.st_blocks < du0 / 3,
+      "%d -> %d blocks" % (du0, st.st_blocks))
+check("compression skips new, open and already-compressed files", not any(os.lstat(f).st_flags & 0x20 for f in (new_f, opened, zipf)))
+lg = jl(dk + "/compressed.jsonl")
+check("every compressed file is recorded", [e["path"] for e in lg if e["ev"] == "compress"] == [big], lg)
+check("no temporary copies left behind", not [f for _, _, fs in os.walk(root) for f in fs if f.endswith(".am-tmp")])
+open(fake, "w").write("10")
+r = sh(sys.executable, SM, "uncompress", env=env, t=300)
+check("uncompress refuses while less than 50 GB would stay free", os.lstat(big).st_flags & 0x20 and "1 still compressed" in r.stdout, r.stdout.strip())
+open(fake, "w").write("200")
+r = sh(sys.executable, SM, "uncompress", env=env, t=300)
+check("uncompress restores the file exactly", not os.lstat(big).st_flags & 0x20 and sha(big) == h0 and os.lstat(big).st_mtime == m0, r.stdout.strip())
+
+# disk nearly full: pause the program writing most to disk, resume once there is room again
+dd = tempfile.mkdtemp(); fake2 = dd + "/free"; open(fake2, "w").write("1")
+WM = "monitored_test_writer"
+wr = subprocess.Popen(["/bin/sh", "-c", "exec /usr/bin/python3 -c \"import os,sys\nwhile True:\n f=open(sys.argv[1],'wb'); f.write(os.urandom(4000000)); f.flush(); os.fsync(f.fileno()); f.close()\" %s/w.bin %s" % (dd, WM)], start_new_session=True)
+env2 = {"MONITORED_DIR": dd, "MONITORED_FAKE_DISK": fake2, "MONITORED_DISK_EVERY": "2", "MONITORED_COMPRESS_ROOTS": dd}
+mon = subprocess.Popen([sys.executable, SM, "run", "--tick", "1"], env=dict(os.environ, **env2))
+s_paused = ""
+for _ in range(20):
+    time.sleep(1); s_paused = stat(wr.pid)
+    if "T" in s_paused: break
+check("program filling the disk is paused when under 3 GB are free", "T" in s_paused, s_paused)
+open(fake2, "w").write("8")
+s_res = s_paused
+for _ in range(15):
+    time.sleep(1); s_res = stat(wr.pid)
+    if "T" not in s_res: break
+check("it resumes once 6 GB are free", "T" not in s_res, s_res)
+ev = [e["ev"] for e in jl(dd + "/events.jsonl")]
+check("disk pause and resume are recorded", "dpause" in ev and "undo_dpause" in ev, ev[-6:])
+mon.terminate(); mon.wait(); wr.kill()
+
+# emergency rule: scripts an app started may be paused, the app and protected tools never
+sys.path.insert(0, HERE); os.environ["MONITORED_DIR"] = tempfile.mkdtemp(); import monitored as M
+def P(pid, cmd): return dict(pid=pid, ppid=1, uid=os.getuid(), cpu=0.0, rss=0, stat="R", cmd=cmd + " monitored_test_")
+check("emergency rule allows a script under Claude", M.emergency_ok(P(91001, ".venv/bin/python disguise.py"), 91000, set()))
+check("emergency rule never pauses the app, its helpers, claude or the front app",
+      not any(M.emergency_ok(P(91002, c), 91000, set()) for c in ("/Applications/Claude.app/Contents/MacOS/Claude", "/Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/x",
+              "/Users/x/claude-code/claude", "pytest -q")) and not M.emergency_ok(P(91000, "python x.py"), 91000, set()))
+
 print("\n%d of %d passed" % (sum(results), len(results)))
 sys.exit(0 if all(results) else 1)

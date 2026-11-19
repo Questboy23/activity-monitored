@@ -3,12 +3,15 @@
 While the CPU is oversubscribed, it lowers the priority of busy background programs (taskpolicy -b). While memory runs out, it
 pauses the biggest background command-line program (never an app with a window) and resumes it when memory recovers.
 Every action is undone by an OS-level timer, even if Activity Monitored crashes. It never shows a pop-up, quits or deletes anything.
+While the disk runs short it frees space by turning on macOS transparent compression for big idle files (listed in
+compressed.jsonl, reversible), and below 3 GB it pauses the program writing most to disk until 6 GB are free.
   monitored install           install and start (one command; see README)
   monitored status            what Activity Monitored is doing right now and in the last 24 hours
   monitored on | watch | off  on: act. watch: log what it would do, change nothing. off: stop and undo everything
   monitored battery on|off    battery saver: checks less often while on battery
   monitored protect NAME      never touch programs whose command contains NAME
   monitored gate [--max-wait S] -- CMD   start CMD once memory is not thrashing (waits at most S seconds)
+  monitored uncompress        undo the space-saving compression (it also runs by itself once 60 GB are free)
   monitored uninstall [--purge] | version
 """
 import ctypes, json, os, re, shutil, signal, subprocess, sys, time
@@ -176,6 +179,10 @@ DRY, _would = False, {}
 WARN = dict(disk_min_gb=float(os.environ.get("MONITORED_DISK_MIN_GB", "20")), swap_full=0.9, mem_ticks=10, every=1800)
 _warned, _wstate = {}, dict(disk_t=0.0, mem=0)
 def disk_free_gb():
+    fake = os.environ.get("MONITORED_FAKE_DISK")  # tests: a file holding the free GB to report
+    if fake:
+        try: return float(open(fake).read())
+        except (OSError, ValueError): return None
     try: v = os.statvfs(HOME); return v.f_bavail * v.f_frsize / 1e9
     except OSError: return None
 def notify(key, msg):  # written to the status log only, at most once per kind every 30 minutes: Activity Monitored never shows a pop-up
@@ -188,7 +195,7 @@ def warn_check(lvl, swap, mem_hot):
     if t - _wstate["disk_t"] >= 60:
         _wstate["disk_t"] = t; gb = disk_free_gb()
         if gb is not None and gb < WARN["disk_min_gb"]:
-            notify("disk", "Disk nearly full: %.0f GB free. macOS needs free space for swap; below ~20 GB apps can freeze. Free some space." % gb)
+            notify("disk", "Disk nearly full: %.0f GB free. macOS needs free space for swap; below ~20 GB apps can freeze. Compressing big idle files to make room." % gb)
     _wstate["mem"] = _wstate["mem"] + 1 if (mem_hot or (lvl is not None and lvl >= 2 and swap >= WARN["swap_full"])) else 0
     if _wstate["mem"] >= WARN["mem_ticks"] and t - _warned.get("memory", 0) >= WARN["every"]:  # check the limit first: ps is costly while memory is short
         top = sorted(sample().values(), key=lambda p: -p["rss"])[:3]
@@ -229,26 +236,33 @@ def pausable(p, protected, apps):
     a system program, or anything protected. A paused program keeps its memory and state."""
     return p["pid"] not in protected and p["pid"] not in apps and eligible(p) and not APP_PART.search(p["cmd"])
 
-def pause(p, since=None):
-    """Freezes one program so it stops taking memory. An OS-level timer unfreezes it after 2 minutes even if Activity
-    Monitored crashes; while memory stays short the timer is renewed, at most 10 minutes in all."""
-    pid, J = p["pid"], journal()
+def emergency_ok(p, fg_pid, apps):
+    """Emergency rule, used only when nothing else can be paused: a script that an app started (Python run by Claude, say)
+    may be paused. Never the app itself, its bundled helpers, the monitor, or work protected by name."""
+    c, up = p["cmd"], _user_protect()
+    return (eligible(p) and p["pid"] not in (fg_pid, os.getpid(), os.getppid()) and p["pid"] not in apps and not re.search(r"\.app/", re.sub(r"/Python\.app/Contents/MacOS/Python\b", "", c))  # python3 runs from Python.app; it is still a script
+            and not APP_PART.search(c) and not NEVER.search(c) and not PRIORITY.search(c) and not (up and up.search(c)))
+
+def pause(p, since=None, act="pause", ttl=None, emg=False):
+    """Freezes one program so it stops taking memory (act pause) or filling the disk (act dpause). An OS-level timer
+    unfreezes it after 2 minutes even if Activity Monitored crashes; while the shortage lasts the timer is renewed."""
+    pid, J, ttl = p["pid"], journal(), ttl or MEM["ttl"]
     if DRY:
-        jl(F_EVENTS, dict(t=int(now()), ev="would_pause", pid=pid, name=pname(p["cmd"]), rss=p["rss"])); return False
-    timer = dead_man("/bin/kill -CONT %d" % int(pid), MEM["ttl"])  # undo timer first, as for demote
+        jl(F_EVENTS, dict(t=int(now()), ev="would_" + act, pid=pid, name=pname(p["cmd"]), rss=p["rss"])); return False
+    timer = dead_man("/bin/kill -CONT %d" % int(pid), ttl)  # undo timer first, as for demote
     try: os.kill(pid, signal.SIGSTOP)
     except OSError: cancel_timer({"timer": timer}); return False
     old = J.get(str(pid)); cancel_timer(old)
-    J[str(pid)] = dict(act="pause", name=pname(p["cmd"]), t=now(), ttl=MEM["ttl"], since=since or now(), rss=p["rss"], timer=timer)
+    J[str(pid)] = dict(act=act, name=pname(p["cmd"]), t=now(), ttl=ttl, since=since or now(), rss=p["rss"], timer=timer, emg=emg)
     jsave(F_JOURNAL, J)
-    if not since: jl(F_EVENTS, dict(t=int(now()), ev="pause", pid=pid, name=pname(p["cmd"]), rss=p["rss"]))
+    if not since: jl(F_EVENTS, dict(t=int(now()), ev=act, pid=pid, name=pname(p["cmd"]), rss=p["rss"]))
     return True
 
 def undo(pid, why):
     J = journal(); e = J.pop(str(pid), None)
     if e is None: return
     cancel_timer(e)
-    if e["act"] == "pause":
+    if e["act"] in ("pause", "dpause"):
         try: os.kill(int(pid), signal.SIGCONT)
         except OSError: pass
     else: subprocess.run(["/usr/sbin/taskpolicy", "-B", "-p", str(pid)], capture_output=True)
@@ -258,12 +272,169 @@ def undo(pid, why):
 def revert_all(why="revert-all"):
     for pid in list(journal()): undo(pid, why)
 
+
+# ---------- disk relief: frees space without deleting anything, and records every change so it can be reversed ----------
+DISK = dict(compress_below=float(os.environ.get("MONITORED_COMPRESS_BELOW_GB", "20")), compress_until=25.0, restore_above=60.0, restore_keep=50.0,
+            pause_below=3.0, resume_above=6.0, min_rate=1e6, every=float(os.environ.get("MONITORED_DISK_EVERY", "60")), max_paused=2, ttl=150,
+            min_size=8e6, min_age=3 * 86400, retry=6 * 3600)
+F_COMP, F_CSTATE = DIR + "/compressed.jsonl", DIR + "/compress-state.json"
+SKIP_EXT = set("zip gz tgz xz bz2 zst lz4 7z rar dmg iso pkg sparseimage sparsebundle jpg jpeg png heic gif webp avif mp4 mov m4v mkv avi webm mp3 m4a aac flac ogg opus "
+               "gguf safetensors pt pth onnx bin ckpt npz parquet sqlite db sqlite3 wal shm lock pack idx".split())
+
+def proc_written(pid):
+    """Bytes a program has written to disk since it started (rusage_info_v2.ri_diskio_byteswritten)."""
+    buf = (ctypes.c_uint8 * 256)()
+    if _LIB is None or _LIB.proc_pid_rusage(int(pid), 2, buf) != 0: return None
+    return int.from_bytes(bytes(buf[152:160]), "little")
+
+def comp_roots():
+    r = os.environ.get("MONITORED_COMPRESS_ROOTS")
+    if r: return r.split(":")  # cloud-synced folders are skipped: a rewritten file could be uploaded again
+    try: return sorted(os.path.join(HOME, d) for d in os.listdir(HOME) if not d.startswith(".") and d not in ("Library", "Applications", "Creative Cloud Files", "Dropbox", "Google Drive", "OneDrive", "Box") and os.path.isdir(os.path.join(HOME, d)))
+    except OSError: return []
+
+def compressible(path, size):
+    """Reads 1 MB from the middle and zlib-compresses it: media, models and archives come out at about 100%, so skip them."""
+    import zlib
+    try:
+        with open(path, "rb") as f: f.seek(max(0, size // 2 - (1 << 19))); b = f.read(1 << 20)
+    except OSError: return False
+    return bool(b) and len(zlib.compress(b, 1)) < 0.7 * len(b)
+
+def open_paths():
+    """Every file some program has open right now: rewriting one of those could lose that program's writes."""
+    out = run(["/usr/sbin/lsof", "-n", "-w", "-Fn", "-u", str(ME)], 60)
+    return {l[1:] for l in out.splitlines() if l.startswith("n/")}
+
+def candidates():
+    """Big, idle, compressible files in your home folder, one top folder at a time, largest first. Library, hidden folders
+    (.git, .venv, .ollama) and anything open are skipped."""
+    t, busy = now(), open_paths()
+    for root in comp_roots():
+        out = []
+        for d, dirs, files in os.walk(root):
+            dirs[:] = [x for x in dirs if not x.startswith(".") and not x.endswith((".app", ".photoslibrary", ".bundle"))]
+            for f in files:
+                p = os.path.join(d, f)
+                if f.startswith(".") or f.rsplit(".", 1)[-1].lower() in SKIP_EXT or p in busy: continue
+                try: st = os.lstat(p)
+                except OSError: continue
+                if (st.st_mode & 0o170000) == 0o100000 and st.st_size >= DISK["min_size"] and st.st_nlink == 1 and not st.st_flags & 0x20 \
+                        and t - st.st_mtime > DISK["min_age"] and st.st_uid == ME: out.append((st.st_size, p))
+        for _, p in sorted(out, reverse=True):
+            if compressible(p, os.lstat(p).st_size): yield p
+
+def rewrite(path, compress):
+    """Rewrites one file with macOS transparent compression on (or off). Programs read it exactly as before. The copy
+    is checked byte for byte, and the file is left alone if it changed, is open, or would not shrink."""
+    st = os.lstat(path)
+    tmp = os.path.join(os.path.dirname(path), ".%s.am-tmp" % os.path.basename(path))
+    try:
+        r = subprocess.run(["/usr/bin/ditto", "--hfsCompression", path, tmp] if compress else ["/bin/cp", "-p", path, tmp], capture_output=True, timeout=900)  # ditto --nohfsCompression keeps it compressed; cp -p writes it out plain
+        if r.returncode != 0: return None
+        after = os.lstat(tmp).st_blocks * 512
+        if compress and after > 0.8 * st.st_blocks * 512: return None
+        if subprocess.run(["/usr/bin/cmp", "-s", path, tmp]).returncode != 0: return None
+        if run(["/usr/sbin/lsof", "-t", "--", path], 20).strip(): return None
+        now_st = os.lstat(path)
+        if (now_st.st_mtime, now_st.st_size, now_st.st_ino) != (st.st_mtime, st.st_size, st.st_ino): return None
+        os.replace(tmp, path); tmp = None
+        return st.st_blocks * 512, after
+    except (OSError, subprocess.SubprocessError): return None
+    finally:
+        if tmp and os.path.exists(tmp): os.remove(tmp)  # our own temporary copy, never the original
+
+def comp_log():
+    out = {}
+    if os.path.exists(F_COMP):
+        for x in open(F_COMP):
+            try: e = json.loads(x)
+            except ValueError: continue
+            if e.get("ev") == "compress": out[e["path"]] = e
+            elif e.get("ev") == "restore": out.pop(e["path"], None)
+    return out
+
+def cmd_compress(args):
+    """Background worker the monitor starts while disk is short: compresses files, largest first, until 25 GB are free."""
+    import fcntl
+    lk = open(DIR + "/compress.lock", "w")
+    try: fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError: return
+    saved = n = 0
+    for p in candidates():
+        gb = disk_free_gb()
+        if gb is None or gb >= DISK["compress_until"]: break
+        if gb < 0.3: break  # the temporary copy needs a little room
+        r = rewrite(p, True)
+        if r: n += 1; saved += r[0] - r[1]; jl(F_COMP, dict(t=int(now()), ev="compress", path=p, before=r[0], after=r[1], mtime=os.lstat(p).st_mtime))
+    else:
+        jsave(F_CSTATE, dict(exhausted=now()))  # nothing left to compress: do not walk the disk again for 6 hours
+    jl(F_EVENTS, dict(t=int(now()), ev="compressed", files=n, saved=saved))
+
+def cmd_restore(args):
+    """Undoes compression (`monitored uncompress`). Only while at least 50 GB stay free afterwards."""
+    import fcntl
+    lk = open(DIR + "/compress.lock", "w")
+    try: fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError: return print("compressor is busy; try again in a minute")
+    n = left = 0
+    for p, e in comp_log().items():
+        try: st = os.lstat(p)
+        except OSError: jl(F_COMP, dict(t=int(now()), ev="restore", path=p, gone=True)); continue
+        if not st.st_flags & 0x20: jl(F_COMP, dict(t=int(now()), ev="restore", path=p, already=True)); continue  # rewritten since by its program
+        gb = disk_free_gb() or 0
+        if gb - (e["before"] - e["after"]) / 1e9 < DISK["restore_keep"]: left += 1; continue
+        if rewrite(p, False): n += 1; jl(F_COMP, dict(t=int(now()), ev="restore", path=p))
+        else: left += 1
+    if "--quiet" not in args: print("restored %d files; %d still compressed (they stay compressed until 50 GB would remain free)" % (n, left))
+
+def start_worker(mode):
+    import fcntl
+    try:
+        with open(DIR + "/compress.lock", "w") as lk: fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB); fcntl.flock(lk, fcntl.LOCK_UN)
+    except OSError: return False  # already running
+    subprocess.Popen(["/usr/sbin/taskpolicy", "-b", sys.executable, "-I", os.path.abspath(__file__), mode] + (["--quiet"] if mode == "uncompress" else []),
+                     start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    jl(F_EVENTS, dict(t=int(now()), ev="worker", mode=mode))
+    return True
+
 class Mon:
     def __init__(self):
         self.streak, self.calm, self.n = defaultdict(int), 0, 0
         self.last_fg, self.t_prev, self.c_prev = None, now(), sum(os.times()[:4])
         self.sleep, self.batt, self.tk0, self.fg_t = CFG["tick"], (0.0, False), None, 0.0
         self.mhot = self.mcalm = 0
+        self.severe, self.fg_pid, self.disk_t, self.dw = False, None, 0.0, {}
+
+    def disk(self, t, procs=None, fg_pid=None):
+        """Once a minute. Below 20 GB free: start the compressor. Below 3 GB: pause the program writing most to disk,
+        and resume it once 6 GB are free. Above 60 GB: undo compression while 50 GB stay free."""
+        if t - self.disk_t < DISK["every"]: return
+        dt, self.disk_t, gb = t - self.disk_t, t, disk_free_gb()
+        if gb is None or DRY: return
+        cs = jload(F_CSTATE, {})
+        safe = not TEST_ONLY or os.environ.get("MONITORED_COMPRESS_ROOTS")  # tests never compress real folders
+        if safe and gb < DISK["compress_below"] and t - cs.get("exhausted", 0) > DISK["retry"]: start_worker("compress")
+        elif safe and gb >= DISK["restore_above"] and comp_log(): start_worker("uncompress")
+        dp = {k: e for k, e in journal().items() if e["act"] == "dpause"}
+        if gb >= DISK["resume_above"]:
+            for k in dp: undo(int(k), "disk-ok")
+            self.dw = {}; return
+        procs = procs or sample()
+        if not procs: return
+        for k, e in dp.items():  # still short: renew the pause (the OS timer resumes it if this monitor dies)
+            if int(k) in procs and gb < DISK["resume_above"]: pause(procs[int(k)], since=e["since"], act="dpause", ttl=DISK["ttl"])
+        w = {pid: proc_written(pid) for pid, p in procs.items() if p["uid"] == ME}
+        prev, self.dw = self.dw, {k: v for k, v in w.items() if v is not None}
+        if gb >= DISK["pause_below"] or len(dp) >= DISK["max_paused"]: return
+        if fg_pid is None: fg_pid = foreground(procs)[0]
+        if fg_pid is None: return
+        apps = gui_pids()
+        c = [((self.dw[k] - prev[k]) / max(dt, 1e-3), procs[k]) for k in self.dw if k in prev and str(k) not in dp and emergency_ok(procs[k], fg_pid, apps)]
+        c = [x for x in c if x[0] >= DISK["min_rate"]]  # bytes per second written since the last check
+        if c:
+            d, p = max(c, key=lambda x: x[0])
+            pause(dict(p, rss=footprint(p["pid"])), act="dpause", ttl=DISK["ttl"])
 
     def on_battery(self):  # checked at most once a minute
         if now() - self.batt[0] > 60: self.batt = (now(), "Battery Power" in run(["/usr/bin/pmset", "-g", "batt"]))
@@ -278,7 +449,7 @@ class Mon:
         return use
 
     def light(self, use, lvl, swap, po, t):  # nothing is contended: no process scan, no program spawned except one foreground check every 10 s
-        warn_check(lvl, swap, False); self.streak.clear()  # hot counts from before a calm stretch must not carry over
+        warn_check(lvl, swap, False); self.disk(t); self.streak.clear()  # hot counts from before a calm stretch must not carry over
         if t - self.fg_t >= 10:
             self.fg_t = t; fg = fg_light()
             if fg != self.last_fg: jl(F_FG, dict(t=int(t), app=fg)); self.last_fg = fg
@@ -296,13 +467,17 @@ class Mon:
         paused = {k: e for k, e in journal().items() if e["act"] == "pause"}
         for k, e in paused.items():
             if int(k) in procs and mem_hot and t - e["t"] >= 60:
-                if t - e["since"] < MEM["max_hold"]: pause(procs[int(k)], since=e["since"])
+                if t - e["since"] < MEM["max_hold"]: pause(procs[int(k)], since=e["since"], emg=e.get("emg", False))
                 else: undo(int(k), "max-hold")  # never keep anything frozen for long
         if self.mhot >= MEM["hot_ticks"] and len(paused) < MEM["max_paused"]:
             apps = gui_pids()
             cands = [(footprint(p["pid"]), p) for p in procs.values() if str(p["pid"]) not in paused and pausable(p, protected, apps)]
             cands = sorted((c for c in cands if c[0] >= MEM["min_rss"]), key=lambda c: -c[0])
-            if cands: p = dict(cands[0][1], rss=cands[0][0]); pause(p); self.mhot = 0  # one at a time: give the Mac a check to recover before the next
+            if not cands and self.severe:  # swap nearly full and nothing ordinary to pause: the 2.3 GB script under Claude froze the Mac on Nov 19
+                cands = sorted((c for c in ((footprint(p["pid"]), p) for p in procs.values() if str(p["pid"]) not in paused and emergency_ok(p, self.fg_pid, apps)) if c[0] >= MEM["min_rss"]), key=lambda c: -c[0])
+                emg = bool(cands)
+            else: emg = False
+            if cands: p = dict(cands[0][1], rss=cands[0][0]); pause(p, emg=emg); self.mhot = 0  # one at a time: give the Mac a check to recover before the next
         elif self.mcalm >= MEM["calm_ticks"] and paused:
             undo(int(min(paused, key=lambda k: paused[k]["rss"])), "memory-ok"); self.mcalm = 0  # smallest first: least likely to refill memory
 
@@ -320,8 +495,9 @@ class Mon:
         cpu_frac = (sum(p["cpu"] for p in procs.values()) - sum(procs[k]["cpu"] for k in dem) + sum(e.get("cpu", 0.0) for e in dem.values())) / (100.0 * NCPU)
         cpu_hot, mem_hot = cpu_frac >= CFG["cpu_busy"], (lvl >= 4 or (lvl >= 2 and po >= CFG["pageout_hot"]))
         protected, priority = classify(procs, fg_pid)
-        for k in list(journal()):  # a slowed program that is now protected (you switched to it) is restored at once
-            if int(k) in protected: undo(int(k), "protected")
+        self.severe, self.fg_pid = (lvl >= 4 or swap >= WARN["swap_full"]), fg_pid
+        for k, e in list(journal().items()):  # a slowed program that is now protected (you switched to it) is restored at once
+            if int(k) in protected and not e.get("emg") and e["act"] != "dpause": undo(int(k), "protected")  # emergency pauses end by their own rules
         for x in [x for x in self.streak if x not in procs]: del self.streak[x]
         cands = []
         for p in procs.values():
@@ -349,6 +525,7 @@ class Mon:
                 for pid, e in list(J.items()):
                     if e["act"] == "demote" and t - e["t"] >= 30: undo(int(pid), "calm")  # minimum hold 30 s
         self.relieve(procs, protected, mem_hot, t)
+        self.disk(t, procs, fg_pid)
         J = journal(); warn_check(lvl, swap, mem_hot)
         calm = cpu_frac < CFG["scan_at"] and not mem_hot and not J  # calm: check less often (6 s on power, 10 s on battery); busy: every 3 s
         self.sleep = ((10.0 if self.on_battery() else 6.0) if calm else (5.0 if CFG["saver"] and self.on_battery() else CFG["tick"])) if CFG["adaptive"] else CFG["tick"]
@@ -422,7 +599,7 @@ def cmd_gate(args):
     except OSError as e: sys.exit("monitored gate: cannot run %s: %s" % (cmd[0], e.strerror))
 
 # ---------- install, settings, friendly commands ----------
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 LABEL = os.environ.get("MONITORED_LABEL", "com.activitymonitored.agent")
 PLIST = os.path.join(HOME, "Library", "LaunchAgents", LABEL + ".plist")
 F_SET = DIR + "/settings.json"
@@ -529,10 +706,13 @@ def cmd_status(args):
             if now() - e.get("t", 0) < 86400: ev.append(e)
     names = defaultdict(int)
     for e in ev:
-        if e.get("ev") in ("demote", "would_demote", "pause", "would_pause"): names[e.get("name", "?")] += 1
+        if e.get("ev") in ("demote", "would_demote", "pause", "would_pause", "dpause", "would_dpause"): names[e.get("name", "?")] += 1
     print("Last 24 hours: %d slowdowns or pauses%s." % (sum(names.values()), (", most often " + ", ".join("%s (%d)" % kv for kv in sorted(names.items(), key=lambda kv: -kv[1])[:3])) if names else ""))
     gb = disk_free_gb()
     if gb is not None: print("Disk free: %.0f GB%s." % (gb, " (too low: below %d GB apps can freeze)" % WARN["disk_min_gb"] if gb < WARN["disk_min_gb"] else ""))
+    cl = comp_log()
+    if cl: print("Compressed to free space: %d files, %.1f GB saved. Nothing was deleted; files open exactly as before. Undo: monitored uncompress (runs by itself above 60 GB free)."
+                 % (len(cl), sum(e["before"] - e["after"] for e in cl.values()) / 1e9))
     for e in [e for e in ev if e.get("ev") == "warn"][-3:]:
         m = int((now() - e.get("t", 0)) // 60)
         print("Noted (%s ago): %s" % ("%d h" % (m // 60) if m >= 60 else "%d min" % m, e.get("msg", "")))
@@ -542,7 +722,8 @@ if __name__ == "__main__":
     table = {"run": cmd_run, "gate": cmd_gate, "revert-all": lambda x: revert_all(), "status": cmd_status, "install": cmd_install,
              "uninstall": cmd_uninstall, "protect": cmd_protect, "on": lambda x: set_key("mode", "on"), "watch": lambda x: set_key("mode", "watch"),
              "off": lambda x: set_key("mode", "off"), "battery": lambda x: cmd_toggle("battery_saver", x),
-             "version": lambda x: print(__version__), "status-json": status_json}
+             "version": lambda x: print(__version__), "status-json": status_json,
+             "compress": cmd_compress, "uncompress": cmd_restore}
     if c not in table:
         print(__doc__)
         sys.exit(0 if c in ("", "help", "-h", "--help") else "monitored: unknown command: %s" % c)
