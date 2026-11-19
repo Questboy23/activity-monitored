@@ -631,7 +631,7 @@ def cmd_gate(args):
     except OSError as e: sys.exit("monitored gate: cannot run %s: %s" % (cmd[0], e.strerror))
 
 # ---------- install, settings, friendly commands ----------
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 LABEL = os.environ.get("MONITORED_LABEL", "com.activitymonitored.agent")
 PLIST = os.path.join(HOME, "Library", "LaunchAgents", LABEL + ".plist")
 F_SET = DIR + "/settings.json"
