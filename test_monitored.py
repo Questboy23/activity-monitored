@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Tests for monitored. Run: python3 test_monitored.py. Each test uses its own temp state dir and cleans up its processes."""
-import json, os, subprocess, sys, tempfile, time
+import json, os, re, subprocess, sys, tempfile, time
 import atexit, signal
 # never leave test programs or a test monitor running if the suite stops early (Nov 19: two leaked hogs held 1.2 GB for hours)
 atexit.register(lambda: subprocess.run(["/usr/bin/pkill", "-f", "monitored_test_|activity-monitored/monitored.py run"]))
@@ -243,6 +243,18 @@ check("a script under Claude and a launchd service are never paused, a Terminal 
 check("emergency rule never pauses the app, its helpers, claude or the front app",
       not any(M.emergency_ok(P(91002, c), 91000, set()) for c in ("/Applications/Claude.app/Contents/MacOS/Claude", "/Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/x",
               "/Users/x/claude-code/claude", "pytest -q")) and not M.emergency_ok(P(91000, "python x.py"), 91000, set()))
+
+# runaway under Claude: with swap 90% full, a script Claude started that holds over a quarter of RAM is ended, never paused
+RH = "monitored_test_runaway"
+rh = subprocess.Popen(["/usr/bin/python3", "-c", "b=bytearray(150*1024*1024)\nfor i in range(0,len(b),4096): b[i]=1\nimport time\nwhile True: time.sleep(1)", RH]); time.sleep(3)
+os.environ["MONITORED_TEST_ONLY"] = RH; M.TEST_ONLY = RH
+old = M.CLAUDE, M.MEM["end_frac"]; M.CLAUDE = re.compile(re.escape(os.path.basename(__file__))); M.MEM["end_frac"] = 100e6 / M.RAM
+mo = M.Mon(); mo.end_runaway(M.sample(), 0.85, M.now()); alive_low = rh.poll() is None
+mo.end_runaway(M.sample(), 0.97, M.now()); time.sleep(1); ended = rh.poll() is not None
+M.CLAUDE, M.MEM["end_frac"] = old; os.environ.pop("MONITORED_TEST_ONLY"); M.TEST_ONLY = None
+if rh.poll() is None: rh.kill()
+check("swap 85%: a big script under Claude is left running; swap 97%: it is ended and its rerun command recorded",
+      alive_low and ended and any(RH in json.loads(l)["cmd"] for l in open(M.F_STOPPED)), (alive_low, ended))
 
 # emergency end to end: the only big program is protected (as scripts under Claude are), memory is short and swap full
 EM = "monitored_test_emg"

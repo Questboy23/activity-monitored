@@ -26,6 +26,7 @@ except OSError: pass
 F_STATUS, F_JOURNAL = DIR + "/status.json", DIR + "/journal.json"
 F_LOG, F_EVENTS, F_FG = DIR + "/log.jsonl", DIR + "/events.jsonl", DIR + "/foreground.jsonl"
 NCPU, ME = os.cpu_count() or 8, os.getuid()
+RAM = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
 CFG = dict(tick=3.0, hog_cpu=20.0, hog_ticks=3, cpu_busy=0.75, calm_ticks=3, demote_ttl=90,
            max_demote=40, pageout_hot=60.0, adaptive=True, scan_at=0.72, saver=False)
 
@@ -217,7 +218,8 @@ def apply(act, p, ttl):
         jl(F_EVENTS, dict(t=int(now()), ev=act, pid=pid, name=pname(p["cmd"]), cpu=p["cpu"]))
     return True
 
-MEM = dict(min_rss=100e6, max_paused=3, ttl=120, max_hold=600, hot_ticks=2, calm_ticks=3)
+MEM = dict(min_rss=100e6, max_paused=3, ttl=120, max_hold=600, hot_ticks=2, calm_ticks=3,
+           end_swap=float(os.environ.get("MONITORED_END_SWAP", "0.9")), end_frac=float(os.environ.get("MONITORED_END_FRAC", "0.25")))
 
 APP_PART = re.compile(r"\.app/Contents/(Frameworks|Helpers|XPCServices|PlugIns|Library)/| Helper\b")
 
@@ -317,6 +319,9 @@ F_COMP, F_CSTATE = DIR + "/compressed.jsonl", DIR + "/compress-state.json"
 F_STOPPED = DIR + "/stopped.jsonl"  # programs ended to save the Mac, with the command and folder to rerun them
 
 def end_paused(q, e, f):
+    end_proc(q, e, f, "Ended %s: it was paused and held %.0f GB of swap while the disk was nearly full." % (e["name"], f / 1e9))
+
+def end_proc(q, e, f, msg):
     """A paused program keeps all its memory, and macOS keeps it in swap files on this disk. Nov 19: run_bench.py
     sat paused for 4 hours holding 22 GB of swap, the disk hit 0 GB free and apps froze. Ending it is the only way to
     free that room. Records the exact command and folder first, so it can be run again."""
@@ -333,7 +338,7 @@ def end_paused(q, e, f):
     else:
         if pname(run(["/bin/ps", "-o", "command=", "-p", str(pid)]).strip()) == e["name"]: os.kill(pid, signal.SIGKILL)
     jl(F_EVENTS, dict(t=int(now()), ev="end", pid=pid, name=e["name"], rss=int(f)))
-    notify("end", "Ended %s: it was paused and held %.0f GB of swap while the disk was nearly full. Rerun: cd %s && %s" % (e["name"], f / 1e9, cwd[0] if cwd else "~", q["cmd"]))
+    notify("end", "%s Rerun: cd %s && %s" % (msg, cwd[0] if cwd else "~", q["cmd"]))
 
 SKIP_EXT = set("zip gz tgz xz bz2 zst lz4 7z rar dmg iso pkg sparseimage sparsebundle jpg jpeg png heic gif webp avif mp4 mov m4v mkv avi webm mp3 m4a aac flac ogg opus "
                "gguf safetensors pt pth onnx bin ckpt npz parquet sqlite db sqlite3 wal shm lock pack idx".split())
@@ -523,6 +528,25 @@ class Mon:
         self.sleep, self.batt, self.tk0, self.fg_t = CFG["tick"], (0.0, False), None, 0.0
         self.mhot = self.mcalm = 0
         self.severe, self.fg_pid, self.disk_t, self.dw, self.swap_prev, self.held = False, None, 0.0, {}, [], {}
+        self.end_t = self.end_chk = 0.0
+
+    def end_runaway(self, procs, swap, t):
+        """Swap 90% full: macOS is about to pause apps, Claude included (its out-of-memory window lists them in red,
+        night of Nov 19). A script Claude started that holds over a quarter of RAM is ended and its command recorded.
+        Pausing it would stall that Claude session for good; ending it hands the session an error and it carries on."""
+        self.end_chk = t
+        if swap is None or swap < MEM["end_swap"] or t - self.end_t < 300: return
+        mine, x = set(), os.getpid()
+        while x > 1 and x in procs: mine.add(x); x = procs[x]["ppid"]
+        kids = defaultdict(list)
+        for p in procs.values(): kids[p["ppid"]].append(p["pid"])
+        claude = {k for k, p in procs.items() if CLAUDE.search(p["cmd"])}
+        under = set().union(*[tree(kids, k) for k in claude]) - claude - mine
+        c = [(footprint(k), procs[k]) for k in under if eligible(procs[k]) and not APP_PART.search(procs[k]["cmd"]) and not SYSTEM_PATH.match(procs[k]["cmd"])]
+        c = [x for x in c if x[0] >= MEM["end_frac"] * RAM]
+        if not c: return
+        f, p = max(c, key=lambda x: x[0]); self.end_t = t; n = pname(p["cmd"])
+        end_proc(p, dict(name=n), f, "Ended %s, started by Claude: it held %.1f GB with swap %.0f%% full, and macOS was about to pause every app." % (n, f / 1e9, swap * 100))
 
     def disk(self, t, procs=None, fg_pid=None):
         """Keeps free disk at or above the target (30 GB unless set with `monitored disk-target GB`), once a minute.
@@ -623,7 +647,7 @@ class Mon:
     def tick(self):
         if os.environ.get("MONITORED_FAULT"): raise RuntimeError("fault injection (tests only)")
         use = self.cheap(); lvl, swap, po = memory(); t = now(); self.n += 1
-        if not (use is None or use >= CFG["scan_at"] or journal() or lvl >= 4 or (lvl >= 2 and po >= CFG["pageout_hot"])): return self.light(use, lvl, swap, po, t)
+        if not (use is None or use >= CFG["scan_at"] or journal() or lvl >= 4 or (lvl >= 2 and po >= CFG["pageout_hot"]) or (swap is not None and swap >= MEM["end_swap"] and t - self.end_chk >= 30)): return self.light(use, lvl, swap, po, t)
         procs = sample()
         if not procs: return  # ps timed out: an empty table would mark every journal pid dead and drop its undo
         fg_pid, fg = foreground(procs)
@@ -664,6 +688,7 @@ class Mon:
                 for pid, e in list(J.items()):
                     if e["act"] == "demote" and t - e["t"] >= 30: undo(int(pid), "calm")  # minimum hold 30 s
         self.relieve(procs, protected, mem_hot, t)
+        self.end_runaway(procs, swap, t)
         self.disk(t, procs, fg_pid)
         J = journal(); warn_check(lvl, swap, mem_hot)
         calm = cpu_frac < CFG["scan_at"] and not mem_hot and not J  # calm: check less often (6 s on power, 10 s on battery); busy: every 3 s
