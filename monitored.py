@@ -232,16 +232,37 @@ def gui_pids():
     """Processes macOS lists as apps (Dock icon or menu bar item)."""
     return {int(x) for x in re.findall(r"pid = (\d+)", run(["/usr/bin/lsappinfo", "list"], 8))}
 
+CLAUDE = re.compile(r"/Claude\.app/|\.local/share/claude/versions|(^|/)claude( |$)")
+
+def services():
+    """Pids of background services launchd keeps running (LaunchAgents); apps also show up there, as application.*."""
+    return {int(l.split("\t")[0]) for l in run(["/bin/launchctl", "list"]).splitlines()[1:]
+            if l.split("\t")[0].isdigit() and not l.split("\t")[-1].startswith("application.")}
+
+def untouchable(procs, svc=None):
+    """Never paused or ended, even in an emergency: Claude and everything under it (a paused tool call froze a Claude
+    session overnight on Nov 20), and services launchd keeps running (harness-router, which Claude calls, was paused
+    and ended 4 times that night; launchd restarted it each time). Claude above this monitor itself does not count,
+    so the test suite, run from Claude, can still exercise pausing."""
+    mine, x = set(), os.getpid()
+    while x > 1 and x in procs: mine.add(x); x = procs[x]["ppid"]
+    kids = defaultdict(list)
+    for p in procs.values(): kids[p["ppid"]].append(p["pid"])
+    s, svc = set(), services() if svc is None else svc
+    for p in procs.values():
+        if p["pid"] not in mine and (CLAUDE.search(p["cmd"]) or p["pid"] in svc): s |= tree(kids, p["pid"])
+    return s - mine
+
 def pausable(p, protected, apps):
     """Memory relief only pauses your own background work (scripts, builds, servers): never an app, an app's helper,
     a system program, or anything protected. A paused program keeps its memory and state."""
     return p["pid"] not in protected and p["pid"] not in apps and eligible(p) and not APP_PART.search(p["cmd"])
 
-def emergency_ok(p, fg_pid, apps):
+def emergency_ok(p, fg_pid, apps, skip=frozenset()):
     """Emergency rule, used only when nothing else can be paused: a script that an app started (Python run by Claude, say)
     may be paused. Never the app itself, its bundled helpers, the monitor, or work protected by name."""
     c, up = p["cmd"], _user_protect()
-    return (eligible(p) and not SYSTEM_PATH.match(c) and p["pid"] not in (fg_pid, os.getpid(), os.getppid()) and p["pid"] not in apps and not re.search(r"\.app/", re.sub(r"/Python\.app/Contents/MacOS/Python\b", "", c))  # python3 runs from Python.app; it is still a script
+    return (eligible(p) and p["pid"] not in skip and not SYSTEM_PATH.match(c) and p["pid"] not in (fg_pid, os.getpid(), os.getppid()) and p["pid"] not in apps and not re.search(r"\.app/", re.sub(r"/Python\.app/Contents/MacOS/Python\b", "", c))  # python3 runs from Python.app; it is still a script
             and not APP_PART.search(c) and not NEVER.search(c) and not PRIORITY.search(c) and not (up and up.search(c)))
 
 def pause(p, since=None, act="pause", ttl=None, emg=False):
@@ -538,16 +559,16 @@ class Mon:
         if len(dp) >= DISK["max_paused"] or not (gb < DISK["pause_below"] or (gb < T / 3 and grew)): return
         if fg_pid is None: fg_pid = foreground(procs)[0]
         if fg_pid is None: return
-        apps = gui_pids()
+        apps, u = gui_pids(), untouchable(procs)
         if gb < DISK["pause_below"]:
-            c = [((self.dw[k] - prev[k]) / max(dt, 1e-3), procs[k]) for k in self.dw if k in prev and str(k) not in dp and k not in self.held and emergency_ok(procs[k], fg_pid, apps)]
+            c = [((self.dw[k] - prev[k]) / max(dt, 1e-3), procs[k]) for k in self.dw if k in prev and str(k) not in dp and k not in self.held and emergency_ok(procs[k], fg_pid, apps, u)]
             c = [x for x in c if x[0] >= DISK["min_rate"]]  # bytes per second written since the last check
             if c:
                 d, p = max(c, key=lambda x: x[0])
                 return pause(dict(p, rss=footprint(p["pid"])), act="dpause", ttl=DISK["ttl"])
         if gb < T / 3 and grew:  # swap files live on this disk: a growing one eats the room compression made (Nov 19: 24 GB run_bench.py)
             protected, _ = classify(procs, fg_pid)
-            c = [(footprint(k), p) for k, p in procs.items() if str(k) not in dp and k not in self.held and not SYSTEM_PATH.match(p["cmd"]) and (pausable(p, protected, apps) or emergency_ok(p, fg_pid, apps))]
+            c = [(footprint(k), p) for k, p in procs.items() if str(k) not in dp and k not in self.held and not SYSTEM_PATH.match(p["cmd"]) and (pausable(p, protected | u, apps) or emergency_ok(p, fg_pid, apps, u))]
             c = [x for x in c if x[0] >= DISK["min_mem"]]
             if c:
                 f, p = max(c, key=lambda x: x[0])
@@ -588,11 +609,11 @@ class Mon:
                 if t - e["since"] < MEM["max_hold"]: pause(procs[int(k)], since=e["since"], emg=e.get("emg", False))
                 else: undo(int(k), "max-hold")  # never keep anything frozen for long
         if self.mhot >= MEM["hot_ticks"] and len(paused) < MEM["max_paused"]:
-            apps = gui_pids()
-            cands = [(footprint(p["pid"]), p) for p in procs.values() if str(p["pid"]) not in paused and pausable(p, protected, apps)]
+            apps, u = gui_pids(), untouchable(procs)
+            cands = [(footprint(p["pid"]), p) for p in procs.values() if str(p["pid"]) not in paused and pausable(p, protected | u, apps)]
             cands = sorted((c for c in cands if c[0] >= MEM["min_rss"]), key=lambda c: -c[0])
             if not cands and self.severe:  # swap nearly full and nothing ordinary to pause: the 2.3 GB script under Claude froze the Mac on Nov 19
-                cands = sorted((c for c in ((footprint(p["pid"]), p) for p in procs.values() if str(p["pid"]) not in paused and emergency_ok(p, self.fg_pid, apps)) if c[0] >= MEM["min_rss"]), key=lambda c: -c[0])
+                cands = sorted((c for c in ((footprint(p["pid"]), p) for p in procs.values() if str(p["pid"]) not in paused and emergency_ok(p, self.fg_pid, apps, u)) if c[0] >= MEM["min_rss"]), key=lambda c: -c[0])
                 emg = bool(cands)
             else: emg = False
             if cands: p = dict(cands[0][1], rss=cands[0][0]); pause(p, emg=emg); self.mhot = 0  # one at a time: give the Mac a check to recover before the next

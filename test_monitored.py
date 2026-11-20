@@ -230,7 +230,16 @@ mon.terminate(); mon.wait(); wr.kill()
 # emergency rule: scripts an app started may be paused, the app and protected tools never
 sys.path.insert(0, HERE); os.environ["MONITORED_DIR"] = tempfile.mkdtemp(); import monitored as M
 def P(pid, cmd): return dict(pid=pid, ppid=1, uid=os.getuid(), cpu=0.0, rss=0, stat="R", cmd=cmd + " monitored_test_")
-check("emergency rule allows a script under Claude", M.emergency_ok(P(91001, ".venv/bin/python disguise.py"), 91000, set()))
+check("emergency rule allows a script an app started", M.emergency_ok(P(91001, ".venv/bin/python disguise.py"), 91000, set()))
+fake = {91100: dict(P(91100, "/Applications/Claude.app/Contents/MacOS/Claude"), ppid=1), 91101: dict(P(91101, "/Users/x/.local/share/claude/versions/2.1/claude"), ppid=91100),
+        91102: dict(P(91102, ".venv/bin/python tool.py"), ppid=91101), 91103: dict(P(91103, "/Users/x/.local/bin/uv run python -m router.server"), ppid=1),
+        91104: dict(P(91104, ".venv/bin/python -m router.server"), ppid=91103), 91105: dict(P(91105, "/Applications/Terminal.app/Contents/MacOS/Terminal"), ppid=1),
+        91106: dict(P(91106, "python big.py"), ppid=91105)}
+u = M.untouchable(fake, {91103})
+check("launchd services are listed", len(M.services()) > 0)
+check("a script under Claude and a launchd service are never paused, a Terminal script still can be",
+      {91101, 91102, 91103, 91104} <= u and 91106 not in u and not M.emergency_ok(fake[91102], 91000, set(), u) and not M.emergency_ok(fake[91104], 91000, set(), u)
+      and M.emergency_ok(fake[91106], 91000, set(), u), sorted(u))
 check("emergency rule never pauses the app, its helpers, claude or the front app",
       not any(M.emergency_ok(P(91002, c), 91000, set()) for c in ("/Applications/Claude.app/Contents/MacOS/Claude", "/Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/x",
               "/Users/x/claude-code/claude", "pytest -q")) and not M.emergency_ok(P(91000, "python x.py"), 91000, set()))
