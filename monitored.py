@@ -7,7 +7,8 @@ full, it can't make more swap, so it pauses apps and lists them in red. Activity
      uv, pip and npm, which delete only download caches those tools fetch again when needed. Nothing else
      is ever deleted. Turn it off with `monitored clean off`.
   2. Warns you early with a macOS notification, at most once per 30 minutes per kind: when free disk drops below
-     15 GB, and when memory is nearly exhausted (naming the 3 biggest programs so you can quit one).
+     15 GB, and when memory is nearly exhausted (naming the 3 biggest programs so you can quit one). Under 10 GB
+     free, or with memory exhausted, it also shows an alert that closes itself after 60 seconds, since Focus hides banners.
   3. Keeps the front app smooth while the CPU is overloaded, by lowering the priority of busy background
      command-line programs (taskpolicy -b). Each one is restored when the CPU calms down, after 10 minutes at most,
      and by an OS timer even if Activity Monitored crashes. Apps with windows are never touched.
@@ -80,12 +81,16 @@ def sample():
 def pname(cmd): return os.path.basename(cmd.split(" -")[0].split(" /")[0]).strip()[:40]
 
 _warned = {}
-def notify(kind, msg):
-    """macOS notification banner (no window to click away), at most once per kind every 30 minutes."""
+def notify(kind, msg, urgent=False):
+    """macOS notification banner, at most once per kind every 30 minutes. Focus mode hides banners, so an urgent
+    warning (apps about to be paused) also shows an alert that closes itself after 60 seconds."""
     if now() - _warned.get(kind, 0) < WARN_EVERY: return False
     _warned[kind] = now(); jl(F_EVENTS, dict(t=int(now()), ev="warn", kind=kind, msg=msg))
     if not os.environ.get("MONITORED_NO_BANNER"):
         run(["/usr/bin/osascript", "-e", 'display notification %s with title "Activity Monitored"' % json.dumps(msg)])
+        if urgent:
+            subprocess.Popen(["/usr/bin/osascript", "-e", 'display alert "Activity Monitored" message %s giving up after 60' % json.dumps(msg)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     return True
 
 def protected():
@@ -149,13 +154,13 @@ def cmd_run(args):
         last_mem = last_mem + 1 if (lvl >= 4 or (lvl >= 2 and sw > 0.9)) else 0
         if last_mem >= 6:  # 30 seconds of real memory exhaustion
             top = sorted(procs.values(), key=lambda p: -p["rss"])[:3]
-            notify("memory", "Memory almost full. Biggest: %s. Quit one to avoid paused apps." % ", ".join("%s %.1f GB" % (pname(p["cmd"]), p["rss"] / 1e9) for p in top))
+            notify("memory", "Memory almost full. Biggest: %s. Quit one to avoid paused apps." % ", ".join("%s %.1f GB" % (pname(p["cmd"]), p["rss"] / 1e9) for p in top), urgent=True)
         if now() - t_disk >= 60:
             t_disk, gb, target = now(), disk_free_gb(), float(settings()["disk_target_gb"])
             if gb < target and settings()["clean"] and now() - t_clean > CLEAN_EVERY:
                 t_clean = now(); freed = clean_caches(); gb = disk_free_gb()
                 if freed >= 0.5: notify("clean", "Freed %.1f GB of download caches (uv, pip, npm). %.0f GB free now." % (freed, gb))
-            if gb < 15: notify("disk", "Only %.0f GB free on the disk. Below about 10 GB macOS starts pausing apps. Free up space." % gb)
+            if gb < 15: notify("disk", "Only %.0f GB free on the disk. Below about 10 GB macOS starts pausing apps. Free up space." % gb, urgent=gb < 10)
         jsave(F_STATUS, dict(ts=now(), cpu=round(cpu, 2), swap=round(sw, 2), pressure=lvl, disk_gb=round(disk_free_gb(), 1), last_clean=t_clean,
                              lowered=[e["name"] for e in jload(F_JOURNAL, {}).values()]))
         if args and args[0] == "--once": return

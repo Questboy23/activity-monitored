@@ -12,7 +12,7 @@ That window appears when the disk is nearly full. macOS moves memory it can't fi
 | What | When | Exactly what it does | Undo |
 |---|---|---|---|
 | Keeps disk room for swap | Free disk below the target (30 GB by default), at most once every 6 hours | Runs `uv cache prune`, `pip3 cache purge` and `npm cache clean --force`. Each deletes only that tool's download cache, which the tool downloads again when needed. Nothing else is ever deleted. | The caches refill on the next install. Turn it off: `monitored clean off` |
-| Warns you early | Free disk under 15 GB, or memory pressure critical for 30 seconds | Shows a macOS notification banner, at most once per 30 minutes per kind. The memory banner names the 3 biggest programs so you can quit one. | Nothing to undo |
+| Warns you early | Free disk under 15 GB, or memory pressure critical for 30 seconds | Shows a macOS notification banner, at most once per 30 minutes per kind. The memory banner names the 3 biggest programs so you can quit one. Under 10 GB free, or with memory exhausted, it also shows an alert that closes itself after 60 seconds, because Focus mode hides banners. | Nothing to undo |
 | Keeps the front app smooth | CPU over 75% busy | Lowers the priority of busy background command-line programs with `taskpolicy -b`. Apps with windows, Logic, music, calls and Claude are never touched. | Restored when the CPU drops under 50%, after 10 minutes at most, and by an OS timer even if Activity Monitored crashes |
 
 It never pauses, quits, kills or rewrites any program or file.
