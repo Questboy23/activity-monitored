@@ -128,7 +128,8 @@ def clean_caches():
     for c in CLEANERS:
         exe = shutil.which(c[0], path="/opt/homebrew/bin:/usr/local/bin:%s/.local/bin:/usr/bin" % HOME)
         if exe:
-            run([exe] + c[1:], 1800); done.append(" ".join(c))
+            os.environ["UV_LOCK_TIMEOUT"] = "30"  # another uv holding its lock must not stall warnings for 5 minutes
+            run([exe] + c[1:], 600); done.append(" ".join(c))
     freed = disk_free_gb() - before
     jl(F_EVENTS, dict(t=int(now()), ev="clean", cmds=done, freed_gb=round(freed, 1)))
     return freed
