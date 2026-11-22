@@ -1,7 +1,7 @@
 #!/bin/bash
 # Activity Monitored installer for macOS.
 # One line:  curl -fsSL https://raw.githubusercontent.com/Questboy23/activity-monitored/main/install.sh | bash
-# Options (after "bash -s --" when piped): --mode on|watch|off   --ai on|off
+# Installs to ~/.monitored and starts it at every login.
 set -e
 RAW="${MONITORED_RAW:-https://raw.githubusercontent.com/Questboy23/activity-monitored/main}"
 H="${MONITORED_DIR:-$HOME/.monitored}"
