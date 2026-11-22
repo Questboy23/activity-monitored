@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for Activity Monitored 1.0. Run: python3 test_monitored.py. Uses a temp state folder; touches no real program."""
+"""Tests for Activity Monitored 1.1. Run: python3 test_monitored.py. Uses a temp state folder; touches no real program."""
 import importlib.util, json, os, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
