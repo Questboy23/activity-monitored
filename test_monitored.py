@@ -87,4 +87,5 @@ check("one loop writes a status with disk, swap and pressure", all(k in st for k
 check("nothing is deleted except by the 3 cache commands", [c[0] for c in m.CLEANERS] == ["uv", "pip3", "npm"])
 src = open(os.path.join(HERE, "monitored.py")).read()
 check("it never kills or rewrites: no SIGKILL/SIGTERM on programs, no file rewrite", "os.kill(pid, 9)" not in src and "SIGTERM" not in src and "ditto" not in src)
+check("never opens a window with an OK button", "display alert" not in src and "display dialog" not in src)
 print("%d of %d passed" % (sum(ok), len(ok))); sys.exit(0 if all(ok) else 1)

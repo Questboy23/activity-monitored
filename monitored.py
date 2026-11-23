@@ -7,8 +7,8 @@ full, it can't make more swap, so it pauses apps and lists them in red. Activity
      uv, pip and npm, which delete only download caches those tools fetch again when needed. Nothing else
      is ever deleted. Turn it off with `monitored clean off`.
   2. Stays quiet. Normal use shows nothing; actions go to `monitored status`. It speaks only when it cannot fix the
-     problem itself (under 10 GB free, or memory still critical 30 seconds after pausing): one alert that closes after
-     60 seconds, at most once every 6 hours per kind, naming the 3 biggest programs for memory.
+     problem itself (under 10 GB free, or memory still critical 30 seconds after pausing): one notification banner
+     (no OK button), at most once every 6 hours per kind, naming the 3 biggest programs for memory.
   3. Pauses before macOS does. When memory pressure turns critical (or warning with under 10 GB of disk, where swap
      cannot grow), it pauses the biggest program you are not using (SIGSTOP), 500 MB or more, scripts before apps,
      at most 3 at once. A paused program keeps all its work, stops taking more memory, and macOS compresses or swaps
@@ -33,7 +33,7 @@ import ctypes, json, os, re, shutil, signal, struct, subprocess, sys, time
 from collections import defaultdict
 _libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 HOME = os.path.expanduser("~")
 DIR = os.environ.get("MONITORED_DIR", os.path.join(HOME, ".monitored"))
 os.makedirs(DIR, exist_ok=True)
@@ -94,15 +94,11 @@ def pname(cmd): return os.path.basename(cmd.split(" -")[0].split(" /")[0]).strip
 
 _warned = {}
 def notify(kind, msg, urgent=False):
-    """macOS notification banner, at most once per kind every 6 hours. Focus mode hides banners, so an urgent
-    warning (apps about to be paused) also shows an alert that closes itself after 60 seconds."""
+    """macOS notification banner, at most once per kind every 6 hours. Never a window with an OK button."""
     if now() - _warned.get(kind, 0) < WARN_EVERY: return False
     _warned[kind] = now(); jl(F_EVENTS, dict(t=int(now()), ev="warn", kind=kind, msg=msg))
     if not os.environ.get("MONITORED_NO_BANNER"):
         run(["/usr/bin/osascript", "-e", 'display notification %s with title "Activity Monitored"' % json.dumps(msg)])
-        if urgent:
-            subprocess.Popen(["/usr/bin/osascript", "-e", 'display alert "Activity Monitored" message %s giving up after 60' % json.dumps(msg)],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     return True
 
 def protected():
