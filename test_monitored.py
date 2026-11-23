@@ -6,6 +6,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 tmp = tempfile.mkdtemp(); os.environ.update(MONITORED_DIR=tmp, MONITORED_NO_BANNER="1")
 spec = importlib.util.spec_from_file_location("m", os.path.join(HERE, "monitored.py")); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 ok = []
+m.jsave(m.F_SET, dict(clean=False))  # tests never run the real cache cleanup
 def check(name, cond): ok.append(bool(cond)); print(("PASS  " if cond else "FAIL  ") + name)
 
 P = lambda cmd, uid=os.getuid(): dict(pid=99999, ppid=1, uid=uid, cpu=90.0, rss=1, stat="S", cmd=cmd)
@@ -42,6 +43,10 @@ m.jsave(m.F_JOURNAL, {})  # as if Activity Monitored crashed and lost its record
 time.sleep(3.5)
 check("OS timer resumes it even with no monitor", "T" not in st_of(kid.pid))
 kid.kill(); m.MAX_PAUSE = 1800
+
+check("memory size counts swapped memory too (physical footprint)", m.footprint(os.getpid()) > 1e6 and m.footprint(1) == 0)
+
+check("local AI model runners are unloaded, the ollama server is left alone", m.OLLAMA.search("/opt/homebrew/Cellar/ollama/0.40.6/libexec/ollama runner --model qwen3.5:9b") and not m.OLLAMA.search("/opt/homebrew/bin/ollama serve"))
 
 procs = {1: dict(pid=1, ppid=0, uid=0, cpu=0, rss=1, stat="S", cmd="/sbin/launchd"),
          10: dict(pid=10, ppid=1, uid=os.getuid(), cpu=0, rss=9e9, stat="S", cmd="/Applications/Claude.app/Contents/MacOS/Claude"),

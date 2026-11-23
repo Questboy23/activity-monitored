@@ -6,9 +6,9 @@ full, it can't make more swap, so it pauses apps and lists them in red. Activity
   1. Keeps disk room for swap. Below the disk target (default 30 GB free) it runs the official cleanup commands of
      uv, pip and npm, which delete only download caches those tools fetch again when needed. Nothing else
      is ever deleted. Turn it off with `monitored clean off`.
-  2. Warns you early with a macOS notification, at most once per 30 minutes per kind: when free disk drops below
-     15 GB, and when memory is nearly exhausted (naming the 3 biggest programs so you can quit one). Under 10 GB
-     free, or with memory exhausted, it also shows an alert that closes itself after 60 seconds, since Focus hides banners.
+  2. Stays quiet. Normal use shows nothing; actions go to `monitored status`. It speaks only when it cannot fix the
+     problem itself (under 10 GB free, or memory still critical 30 seconds after pausing): one alert that closes after
+     60 seconds, at most once every 6 hours per kind, naming the 3 biggest programs for memory.
   3. Pauses before macOS does. When memory pressure turns critical (or warning with under 10 GB of disk, where swap
      cannot grow), it pauses the biggest program you are not using (SIGSTOP), 500 MB or more, scripts before apps,
      at most 3 at once. A paused program keeps all its work, stops taking more memory, and macOS compresses or swaps
@@ -29,10 +29,11 @@ Every action is temporary. It never quits, kills, deletes or rewrites any progra
   monitored protect NAME                 never touch programs whose command contains NAME
   monitored uncompress                   undo the file compression older versions (0.x) did
 """
-import json, os, re, shutil, signal, subprocess, sys, time
+import ctypes, json, os, re, shutil, signal, struct, subprocess, sys, time
 from collections import defaultdict
+_libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 HOME = os.path.expanduser("~")
 DIR = os.environ.get("MONITORED_DIR", os.path.join(HOME, ".monitored"))
 os.makedirs(DIR, exist_ok=True)
@@ -41,7 +42,7 @@ F_COMP = DIR + "/compressed.jsonl"  # written by 0.x; read only by `uncompress`
 LABEL, PLIST, SELF = "com.activitymonitored.agent", os.path.join(HOME, "Library/LaunchAgents/com.activitymonitored.agent.plist"), os.path.abspath(__file__)
 NCPU, ME = os.cpu_count() or 8, os.getuid()
 DEFAULTS = dict(mode="on", clean=True, disk_target_gb=30)
-TICK, HOG_CPU, HOG_TICKS, BUSY, CALM, MAX_HOLD, WARN_EVERY, CLEAN_EVERY = float(os.environ.get("MONITORED_TICK", "5")), 20.0, 3, 0.75, 0.5, 600, 1800, 6 * 3600
+TICK, HOG_CPU, HOG_TICKS, BUSY, CALM, MAX_HOLD, WARN_EVERY, CLEAN_EVERY = float(os.environ.get("MONITORED_TICK", "5")), 20.0, 3, 0.75, 0.5, 600, 6 * 3600, 6 * 3600
 MAX_PAUSE, PAUSE_MIN, MAX_PAUSED, HOT_TICKS, OK_TICKS = 1800, 500e6, 3, 2, 6
 CLAUDE = re.compile(r"/Claude\.app/|\.local/share/claude/versions|(^|/)claude( |$)")
 NEVER = re.compile(r"/(WindowServer|kernel_task|launchd|loginwindow|Finder|Dock|SystemUIServer|coreaudiod|sshd|tmux|Terminal|iTerm2?)(\.app|$| )|monitored\.py")
@@ -93,7 +94,7 @@ def pname(cmd): return os.path.basename(cmd.split(" -")[0].split(" /")[0]).strip
 
 _warned = {}
 def notify(kind, msg, urgent=False):
-    """macOS notification banner, at most once per kind every 30 minutes. Focus mode hides banners, so an urgent
+    """macOS notification banner, at most once per kind every 6 hours. Focus mode hides banners, so an urgent
     warning (apps about to be paused) also shows an alert that closes itself after 60 seconds."""
     if now() - _warned.get(kind, 0) < WARN_EVERY: return False
     _warned[kind] = now(); jl(F_EVENTS, dict(t=int(now()), ev="warn", kind=kind, msg=msg))
@@ -151,6 +152,12 @@ def tree(procs, roots):
         if x not in out: out.add(x); todo += kids[x]
     return out
 
+def footprint(pid):
+    """Physical footprint (RAM plus compressed and swapped pages), what Activity Monitor calls Memory. RSS hides swapped memory."""
+    buf = ctypes.create_string_buffer(256)
+    if _libproc.proc_pid_rusage(int(pid), 2, buf) != 0: return 0  # RUSAGE_INFO_V2; fails for other users' programs
+    return struct.unpack_from("<Q", buf.raw, 72)[0]  # ri_phys_footprint: after uuid[16] and 7 uint64 fields
+
 def pausable(procs, prot, front):
     """Biggest first, scripts before apps. Never: the front app and what it started, Claude and its tools, this monitor
     and its parents, Logic, music, calls, Terminal, system programs, other users' programs, anything already paused."""
@@ -160,9 +167,20 @@ def pausable(procs, prot, front):
     J = jload(F_JOURNAL, {})
     if now() < jload(DIR + "/hold.json", {}).get("until", 0): return []  # you resumed by hand: no new pauses for 10 minutes
     only = os.environ.get("MONITORED_ONLY")  # tests: never touch a real program
-    c = [p for p in procs.values() if p["pid"] not in safe and "T" not in p.get("stat", "") and (not only or only in p["cmd"]) and str(p["pid"]) not in J and p["uid"] == ME and p["rss"] >= PAUSE_MIN
+    c = [dict(p, rss=max(p["rss"], footprint(p["pid"]))) for p in procs.values() if p["pid"] not in safe and "T" not in p.get("stat", "") and (not only or only in p["cmd"]) and str(p["pid"]) not in J and p["uid"] == ME
          and not SYSTEM_PATH.match(p["cmd"]) and not NEVER.search(p["cmd"]) and not PRIORITY.search(p["cmd"]) and not (prot and prot.search(p["cmd"]))]
+    c = [p for p in c if p["rss"] >= PAUSE_MIN]
     return sorted(c, key=lambda p: (bool(APP_PART.search(p["cmd"])), -p["rss"]))
+
+OLLAMA = re.compile(r"ollama\S* runner")
+def unload_models(why):
+    """Unload local AI models (ollama stop). Frees their RAM at once; the model stays on disk and loads again on the next request."""
+    exe = shutil.which("ollama") or next((x for x in ("/opt/homebrew/bin/ollama", "/usr/local/bin/ollama") if os.path.exists(x)), None)
+    if not exe: return False
+    names = [ln.split()[0] for ln in run([exe, "ps"]).splitlines()[1:] if ln.strip()]
+    for n in names: run([exe, "stop", n])
+    if names: jl(F_EVENTS, dict(t=int(now()), ev="unload", models=names, why=why))
+    return bool(names)
 
 def pause(p, why):
     """SIGSTOP now, plus an OS timer that sends SIGCONT after MAX_PAUSE even if this program dies."""
@@ -173,8 +191,6 @@ def pause(p, why):
     except OSError: os.killpg(timer, 9); return False
     J = jload(F_JOURNAL, {}); J[str(pid)] = dict(kind="pause", name=pname(p["cmd"]), t=now(), timer=timer, gb=round(p["rss"] / 1e9, 1)); jsave(F_JOURNAL, J)
     jl(F_EVENTS, dict(t=int(now()), ev="pause", pid=pid, name=pname(p["cmd"]), gb=round(p["rss"] / 1e9, 1), why=why))
-    notify("pause-%d" % pid, "Paused %s (%.1f GB) so the Mac does not run out of memory. It resumes by itself when memory recovers, within 30 minutes. Resume now: monitored resume"
-           % (pname(p["cmd"]), p["rss"] / 1e9))
     return True
 
 def clean_caches():
@@ -211,20 +227,20 @@ def cmd_run(args):
         paused = {k: e for k, e in jload(F_JOURNAL, {}).items() if e.get("kind") == "pause"}
         if hot >= HOT_TICKS and len(paused) < MAX_PAUSED:  # 10 seconds of real pressure: pause one more, then wait another 10
             c = pausable(procs, prot, front_pid())
-            if c: pause(c[0], "memory pressure %d, swap %d%%, disk %.0f GB" % (lvl, 100 * sw, gb_now))
+            why = "memory pressure %d, swap %d%%, disk %.0f GB" % (lvl, 100 * sw, gb_now)
+            if c and not (OLLAMA.search(c[0]["cmd"]) and unload_models(why)): pause(c[0], why)
             hot = 0
         if ok >= OK_TICKS and paused:  # normal for 30 seconds: resume the most recent one
             restore(max(paused, key=lambda k: paused[k]["t"]), "memory recovered"); ok = 0
         last_mem = last_mem + 1 if (lvl >= 4 or (lvl >= 2 and sw > 0.9)) else 0
         if last_mem >= 6:  # 30 seconds of real memory exhaustion
-            top = sorted(procs.values(), key=lambda p: -p["rss"])[:3]
+            top = sorted((dict(p, rss=max(p["rss"], footprint(p["pid"]))) for p in procs.values()), key=lambda p: -p["rss"])[:3]
             notify("memory", "Memory almost full even after pausing. Biggest: %s. Quit one." % ", ".join("%s %.1f GB" % (pname(p["cmd"]), p["rss"] / 1e9) for p in top), urgent=True)
         if now() - t_disk >= 60:
             t_disk, gb, target = now(), disk_free_gb(), float(settings()["disk_target_gb"])
             if gb < target and settings()["clean"] and now() - t_clean > CLEAN_EVERY:
                 t_clean = now(); freed = clean_caches(); gb = disk_free_gb()
-                if freed >= 0.5: notify("clean", "Freed %.1f GB of download caches (uv, pip, npm). %.0f GB free now." % (freed, gb))
-            if gb < 15: notify("disk", "Only %.0f GB free on the disk. Below about 10 GB macOS starts pausing apps. Free up space." % gb, urgent=gb < 10)
+            if gb < 10: notify("disk", "Only %.0f GB free on the disk. Below about 10 GB macOS starts pausing apps. Free up space." % gb, urgent=True)
         jsave(F_STATUS, dict(ts=now(), cpu=round(cpu, 2), swap=round(sw, 2), pressure=lvl, disk_gb=round(disk_free_gb(), 1), last_clean=t_clean,
                              lowered=[e["name"] for e in jload(F_JOURNAL, {}).values() if e.get("kind") != "pause"],
                              paused=["%s (%s GB)" % (e["name"], e.get("gb")) for e in jload(F_JOURNAL, {}).values() if e.get("kind") == "pause"]))
