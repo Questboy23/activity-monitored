@@ -62,7 +62,7 @@ os.remove(m.DIR + "/hold.json")
 # end to end: real loop, fake critical pressure, a real 600 MB program started outside Claude's process tree
 fp = os.path.join(tmp, "pressure"); open(fp, "w").write("4")
 mark = "monitored_e2e_%d" % os.getpid()
-subprocess.run(["sh", "-c", "/usr/bin/python3 -c 'import time; b=bytearray(600*1024*1024); b[::4096]=b\"x\"*len(b[::4096]); time.sleep(300)' %s >/dev/null 2>&1 &" % mark])
+subprocess.run(["sh", "-c", "%s -c 'import time; b=bytearray(600*1024*1024); b[::4096]=b\"x\"*len(b[::4096]); time.sleep(300)' %s >/dev/null 2>&1 &" % (sys.executable, mark)])  # not /usr/bin: SYSTEM_PATH skips those
 time.sleep(2)
 big = int(subprocess.run(["pgrep", "-f", mark], capture_output=True, text=True).stdout.split()[0])
 # MONITORED_ONLY: only the test program may be paused on this real Mac
